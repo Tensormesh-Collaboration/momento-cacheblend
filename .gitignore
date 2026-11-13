@@ -1,0 +1,26 @@
+# Secrets and machine-specific overrides — never commit.
+cacheblend.env.local
+cacheblend.env.local.*
+!cacheblend.env.local.example
+*.bak*
+
+# Generated at runtime
+logs/
+cbplugin/
+.setup.lock
+
+# Model weights, if ever placed inside the repo
+*.safetensors
+*.bin
+
+# Tooling
+__pycache__/
+.idea/
+.vscode/
+.DS_Store
+
+# Benchmark data and outputs
+data/
+schedules/
+runs/
+.pytest_cache/

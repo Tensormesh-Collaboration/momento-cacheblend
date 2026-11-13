@@ -1,0 +1,11 @@
+# Host-side Python for the swarm workload (generate, simulate, replay, summarize).
+# The serving stack itself runs in Docker and needs none of this.
+numpy>=1.24
+pyarrow>=14
+openai>=1.40          # replay: async streaming client
+transformers>=4.45    # the serving model's tokenizer (no PyTorch needed); else tiktoken below
+tiktoken>=0.7         # fallback tokenizer (cl100k) when the model's tokenizer is unavailable
+# tests only
+pytest>=8
+fastapi>=0.110
+uvicorn>=0.29
