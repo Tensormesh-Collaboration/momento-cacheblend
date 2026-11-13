@@ -1,4 +1,4 @@
-# CacheBlend + Valkey: agent-swarm benchmark (Momento × Tensormesh)
+# CacheBlend + Valkey: agent-swarm benchmark (Momento x Tensormesh)
 
 Measure how much prefill a fleet of coding agents skips when LMCache reuses KV
 by prefix or by CacheBlend, from local memory or from a shared Valkey tier.
