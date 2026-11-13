@@ -68,4 +68,6 @@ One message with several possible causes. Check in this order:
 | `non_prefix_pct` is 0 in a B or D leg | Blending never fired | Run `scripts/smoke_cb.py` against the worker; read the vLLM log's `CB:` lines (backend, block size, degraded scatters) |
 | vLLM refuses to boot with CBKVConnector | A flag CacheBlend asserts: chunked prefill on, a compiled mode, `cudagraph_mode=FULL`, PP>1 or speculative decoding | Keep the kit's flags; for an experiment, `CB_DECODE_CUDAGRAPH=0` falls back to `--enforce-eager` |
 | D shows no cross-worker blending | No coordinator: each worker matches only its own chunks | `scripts/coordinator.sh start` and set `COORDINATOR_URL` |
+| `WARN: Valkey evicted keys during some legs` | Valkey filled up during the leg, so its capacity, not L1, limited the run | Give Valkey more memory than the simulator's `L2 peak` for that schedule, or shrink the swarm; rerun the leg |
+| The idle-gap table is empty | No `metrics_timeseries.jsonl` (LMCache metrics unreachable, or `--metrics-interval 0`), no `config.env`, or no idle gaps in the schedule | Run through `run_leg.sh`, on the worker host; check `meta.json`'s `idle_gaps` |
 | `LMCache /metrics unreachable` in the summary | The admin port is bound to loopback | Run the replay on the worker host, or tunnel `LMCACHE_HTTP_PORT+i` |

@@ -5,6 +5,7 @@
     scripts/valkey.py info            # memory, key count, keys under our prefix
     scripts/valkey.py count           # number of keys under our prefix (all primaries)
     scripts/valkey.py blob            # BLOB.INFO on every primary: is valkey-large-object loaded?
+    scripts/valkey.py stats           # JSON: evicted_keys, used/max memory, keys under our prefix (summed)
     scripts/valkey.py wipe            # delete keys under VALKEY_KEY_PREFIX@ only
 
 Reads VALKEY_NODES, VALKEY_CLUSTER, VALKEY_TLS, VALKEY_USERNAME,
@@ -102,7 +103,7 @@ def scan_prefix(c: Conn, pattern: str):
 
 
 def main() -> int:
-    if len(sys.argv) != 2 or sys.argv[1] not in ("ping", "info", "count", "blob", "wipe"):
+    if len(sys.argv) != 2 or sys.argv[1] not in ("ping", "info", "count", "blob", "stats", "wipe"):
         print(__doc__)
         return 2
     action = sys.argv[1]
@@ -110,6 +111,22 @@ def main() -> int:
     pattern = f"{prefix}@*"
     try:
         targets = primaries()
+        if action == "stats":
+            # Before/after each leg (run_leg.sh): evicted_keys must not grow, or
+            # Valkey's own capacity, not L1, limited the run.
+            import json
+            out = {"evicted_keys": 0, "used_memory": 0, "maxmemory": 0, "keys_under_prefix": 0, "primaries": len(targets)}
+            for h, p in targets:
+                c = Conn(h, p)
+                info = {}
+                for section in ("stats", "memory"):
+                    info.update(l.split(":", 1) for l in c.cmd("INFO", section).splitlines() if ":" in l)
+                for k in ("evicted_keys", "used_memory", "maxmemory"):
+                    out[k] += int(info.get(k, 0) or 0)
+                if prefix:
+                    out["keys_under_prefix"] += sum(1 for _ in scan_prefix(c, pattern))
+            print(json.dumps(out))
+            return 0
         if action == "count":
             print(sum(sum(1 for _ in scan_prefix(Conn(h, p), pattern)) for h, p in targets) if prefix else 0)
             return 0

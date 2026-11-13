@@ -58,6 +58,8 @@ class LRU:
         self.cap = capacity  # chunks; 0 = unbounded
         self.d: OrderedDict[int, None] = OrderedDict()
         self.evicted = 0
+        self.inserted = 0  # chunks newly stored (not already resident)
+        self.peak = 0
 
     def __contains__(self, k: int) -> bool:
         return k in self.d
@@ -67,9 +69,11 @@ class LRU:
             self.d.move_to_end(k)
             return
         self.d[k] = None
+        self.inserted += 1
         if self.cap and len(self.d) > self.cap:
             self.d.popitem(last=False)
             self.evicted += 1
+        self.peak = max(self.peak, len(self.d))
 
 
 @dataclass
@@ -107,6 +111,11 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
     per_agent_skip = Counter()
     stored_keys: list[set[int]] = [set() for _ in range(workers)]  # what each local matcher indexed
     runs: list[int] = []  # lengths (tokens) of contiguous CacheBlend matches
+    # Idle-gap eviction pressure: after each request, the agent's worker and that
+    # worker's store/evict counters; at the request after an idle gap, the
+    # difference is what the old worker stored and evicted while the agent waited.
+    last_seen: dict[int, tuple[int, int, int]] = {}
+    gaps: list[dict] = []
     events = [(a.start_s, ai, 0) for ai, a in enumerate(agents)]
     heapq.heapify(events)
     while events:
@@ -187,6 +196,14 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
         by_kind[kind].update(r)
         by_kind[kind]["requests"] += 1
         per_agent_skip[ai] += L - r["new"]
+        if k and ag.turns[k - 1].idle_s and ai in last_seen:
+            w0, ins0, ev0 = last_seen[ai]
+            cap_tokens = l1[w0].cap * chunk
+            stored = (l1[w0].inserted - ins0) * chunk
+            gaps.append({"gap_s": ag.turns[k - 1].idle_s, "moved": turn.moved,
+                         "stored_tokens": stored, "evicted_chunks": l1[w0].evicted - ev0,
+                         "pressure": (stored / cap_tokens) if cap_tokens else 0.0,
+                         "tokens": L, "served": L - r["new"]})
         # --- store --------------------------------------------------------------
         for key in hit_keys:
             l1[w].touch(key)
@@ -198,11 +215,20 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
             stored_keys[w].add(key)
             fleet_index[h].add(key)
             owner.setdefault(key, (ag.dev, ai))
+        last_seen[ai] = (w, l1[w].inserted, l1[w].evicted)
         # --- next turn -------------------------------------------------------------
         service = r["new"] / prefill_tps + turn.max_tokens / decode_tps
         if k + 1 < len(ag.turns):
             heapq.heappush(events, (now + service + turn.after_s + turn.idle_s, ai, k + 1))
     blend_tok = sum(runs) or 1
+    buckets: dict[str, Counter] = {}
+    for g in gaps:
+        b = "<0.25" if g["pressure"] < 0.25 else "0.25-1" if g["pressure"] < 1 else ">=1"
+        c = buckets.setdefault(b, Counter())
+        c["requests"] += 1
+        c["moved"] += g["moved"]
+        c["tokens"] += g["tokens"]
+        c["served"] += g["served"]
     return {"config": config, "chunk": chunk, "totals": dict(tot), "by_kind": {k: dict(v) for k, v in by_kind.items()},
             "l1_evicted_chunks": sum(x.evicted for x in l1), "l2_evicted_chunks": l2.evicted if l2 else 0,
             # The local matcher's table holds 2^20 chunks per server lifetime; past
@@ -210,7 +236,14 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
             "max_chunks_indexed_per_worker": max(len(x) for x in stored_keys),
             "blend_runs": len(runs),
             "blend_tokens_in_runs_under_256": round(100 * sum(x for x in runs if x < 256) / blend_tok, 1),
-            "blend_tokens_in_runs_under_512": round(100 * sum(x for x in runs if x < 512) / blend_tok, 1)}
+            "blend_tokens_in_runs_under_512": round(100 * sum(x for x in runs if x < 512) / blend_tok, 1),
+            "l2_peak_chunks": l2.peak if l2 else 0,
+            # Requests right after an idle gap, by how much the agent's old worker
+            # stored during the gap relative to its L1 capacity (row 9).
+            "idle_gap_pressure": {b: {"requests": c["requests"], "moved": c["moved"],
+                                      "served_pct": round(100 * c["served"] / c["tokens"], 1) if c["tokens"] else None}
+                                  for b, c in sorted(buckets.items(), key=lambda kv: ["<0.25", "0.25-1", ">=1"].index(kv[0]))},
+            "idle_gaps": gaps}
 
 
 def turn_moved(ag: schedule.Agent, k: int) -> bool:
@@ -229,7 +262,8 @@ def shares(t: dict, recompute_ratio: float) -> dict:
 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("schedule", type=Path)
+    ap.add_argument("schedules", type=Path, nargs="+",
+                    help="one or more schedule directories (e.g. the -q0/-q0.5/-q1 outputs of a move sweep)")
     ap.add_argument("--configs", default="ABCD")
     ap.add_argument("--l1-gb", default="32", help="L1 per worker, GiB; comma-separated to sweep")
     ap.add_argument("--l2-gb", type=float, default=0, help="Valkey capacity, GiB (0 = unbounded)")
@@ -244,15 +278,28 @@ def main() -> None:
     ap.add_argument("--tokenizer", default="", help="default: the schedule's")
     ap.add_argument("-o", "--output", type=Path, help="write results JSON here")
     a = ap.parse_args()
-    meta, agents = schedule.load(a.schedule)
-    tok = Tokenizer(a.tokenizer or meta.get("tokenizer"))
+    results = []
+    tokenizers: dict[str, Tokenizer] = {}
+    for sched in a.schedules:
+        results += simulate_one(a, sched, tokenizers)
+    if a.output:
+        a.output.write_text(json.dumps({"args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()},
+                                        "results": results}, indent=2, default=str))
+
+
+def simulate_one(a: argparse.Namespace, sched: Path, tokenizers: dict) -> list[dict]:
+    meta, agents = schedule.load(sched)
+    name = a.tokenizer or meta.get("tokenizer")
+    tok = tokenizers.setdefault(name, Tokenizer(name))
     workers = a.workers or meta["args"].get("workers", 1)
     prompts = Prompts(tok, agents)
     results = []
-    print(f"{meta['repo']}: {len(agents)} agents, {meta['requests']} requests, {workers} workers, "
+    q = meta.get("move_prob", meta["args"].get("move_prob"))
+    print(f"\n{sched.name}: {meta['repo']}, {len(agents)} agents, {meta['requests']} requests, {workers} workers, "
+          f"move probability {q}, {meta.get('idle_gaps', '?')} idle gaps, {meta.get('moves', '?')} moves, "
           f"KV {a.kv_bytes_per_token / 1024:.0f} KiB/token, tokenizer {tok.name}")
     print(f"{'chunk':>5} {'L1/wkr':>7} {'cfg':>3} {'pfx L1':>7} {'pfx L2':>7} {'blnd L1':>7} {'blnd L2':>7} "
-          f"{'new':>6} {'skipped':>8} {'blend<-others':>13} {'blend<256':>9} {'idx/wkr':>8}")
+          f"{'new':>6} {'skipped':>8} {'blend<-others':>13} {'blend<256':>9} {'idx/wkr':>8} {'L2 peak':>8}")
     for chunk in [int(x) for x in a.chunk_size.split(",")]:
         chunk_bytes = a.kv_bytes_per_token * chunk
         for l1_gb in [float(x) for x in a.l1_gb.split(",")]:
@@ -261,20 +308,28 @@ def main() -> None:
             for cfg in a.configs:
                 res = run(prompts, cfg, workers, l1_chunks, l2_chunks, a.fleet_blend and cfg == "D",
                           a.prefill_tps, a.decode_tps, chunk)
-                res.update(l1_gb=l1_gb, l2_gb=a.l2_gb, chunk_bytes=chunk_bytes,
+                res.update(schedule=str(sched), move_prob=q, l1_gb=l1_gb, l2_gb=a.l2_gb, chunk_bytes=chunk_bytes,
                            shares=shares(res["totals"], a.recompute_ratio),
                            shares_by_kind={k: shares(v, a.recompute_ratio) for k, v in res["by_kind"].items()})
                 s = res["shares"]
                 short = f"{res['blend_tokens_in_runs_under_256']:>8}%" if res["blend_runs"] else f"{'-':>9}"
+                peak = f"{res['l2_peak_chunks'] * chunk_bytes / 2**30:.0f}G" if res["l2_peak_chunks"] else "-"
                 print(f"{chunk:>5} {l1_gb:>7g} {cfg:>3} {s['prefix_l1']:>7} {s['prefix_l2']:>7} {s['blend_l1']:>7} "
                       f"{s['blend_l2']:>7} {s['new']:>6} {s['skipped']:>8} {s['blend_other_agents']:>13} "
-                      f"{short} {res['max_chunks_indexed_per_worker']:>8}")
+                      f"{short} {res['max_chunks_indexed_per_worker']:>8} "
+                      f"{peak:>8}")
                 results.append(res)
     print("(% of input tokens; skipped = prefix + blend x (1 - recompute ratio); blend<256 = share of CacheBlend "
-          "tokens in matches shorter than 256 tokens; idx/wkr = chunks a local matcher indexed, cap 2^20)")
-    if a.output:
-        a.output.write_text(json.dumps({"meta": meta, "args": vars(a) | {"schedule": str(a.schedule), "output": str(a.output)},
-                                        "results": results}, indent=2, default=str))
+          "tokens in matches shorter than 256 tokens; idx/wkr = chunks a local matcher indexed, cap 2^20; "
+          "L2 peak = Valkey capacity this run needed, GiB)")
+    gap_rows = [r for r in results if r["idle_gap_pressure"]]
+    if gap_rows:
+        print("\nRequests after an idle gap, by what the agent's old worker stored during the gap / its L1 size "
+              "(% of their input tokens served from cache; n = requests):")
+        for r in gap_rows:
+            cells = "  ".join(f"{b}: {v['served_pct']}% (n={v['requests']})" for b, v in r["idle_gap_pressure"].items())
+            print(f"  chunk {r['chunk']:>3} L1 {r['l1_gb']:g} {r['config']}  {cells}")
+    return results
 
 
 if __name__ == "__main__":

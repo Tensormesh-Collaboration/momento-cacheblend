@@ -259,3 +259,55 @@ def test_simulator_smaller_chunks_recover_span_edges():
     got = {c: simulate.run(p, "B", 1, 0, 0, False, 1e9, 1e9, chunk=c)["totals"].get("blend_l1", 0) for c in (256, 128, 64)}
     assert 0 < got[256] <= got[128] <= got[64] <= 1000
     assert got[64] > got[256]
+
+
+# --- worker-move sweep, idle-gap pressure ------------------------------------------
+
+def test_move_prob_sweep_changes_only_moves(data_dir, tmp_path, monkeypatch):
+    out = tmp_path / "mv"
+    monkeypatch.setattr(sys, "argv", ["generate", "--data", str(data_dir), "--repo", "org__repo", "--tokenizer", "chars",
+                                      "--devs", "2", "--agents", "3", "--harness-tokens", "600",
+                                      "--dev-preamble-tokens", "100", "--workers", "2", "--idle-prob", "0.6",
+                                      "--move-prob", "0,0.5,1", "-o", str(out)])
+    generate.main()
+    loaded = {q: schedule.load(Path(f"{out}-q{q}")) for q in ("0", "0.5", "1")}
+    sig = {q: [[(t.msg, t.after_s, t.idle_s, t.max_tokens) for t in a.turns] for a in ags]
+           for q, (_, ags) in loaded.items()}
+    assert sig["0"] == sig["0.5"] == sig["1"]  # same requests, gaps and idle periods
+    moves = {q: {(a.agent, k) for a in ags for k, t in enumerate(a.turns) if t.moved} for q, (_, ags) in loaded.items()}
+    assert not moves["0"] and moves["0.5"] <= moves["1"] and moves["1"]
+    assert loaded["0.5"][0]["move_prob"] == 0.5
+
+
+def test_simulator_idle_gap_pressure_and_l2_peak():
+    rng = random.Random(5)
+    docs = ["".join(rng.choice("klmnop") for _ in range(6 * CHUNK)) for _ in range(4)]
+    paused = _agent("paused", 0, [docs[0], "back"], start=0.0)
+    paused.turns[0].idle_s = 100.0
+    busy = [_agent(f"b{i}", 1, [docs[i + 1], "more"], start=10.0 + i) for i in range(3)]
+    p = simulate.Prompts(Tokenizer("chars"), [paused] + busy)
+    small = simulate.run(p, "A", 1, 8, 0, False, 1e9, 1e9)   # L1 of 8 chunks: the busy agents evict it
+    big = simulate.run(p, "C", 1, 0, 0, False, 1e9, 1e9)
+    assert set(small["idle_gap_pressure"]) == {">=1"}
+    g = small["idle_gaps"][0]
+    assert g["stored_tokens"] >= 3 * 6 * CHUNK and g["served"] < g["tokens"]
+    assert big["l2_peak_chunks"] > 0 and big["idle_gap_pressure"]["<0.25"]["requests"] == 1
+
+
+def test_replay_timeseries_feeds_gap_pressure(data_dir, tmp_path, mock_engines):
+    _gen(data_dir, tmp_path / "s", "--idle-prob", "0.7", "--move-prob", "1")
+    out = tmp_path / "run"
+    engines = ",".join(f"http://127.0.0.1:{e}" for e, _ in mock_engines)
+    lmc = ",".join(f"http://127.0.0.1:{m}/metrics" for _, m in mock_engines)
+    subprocess.run([sys.executable, "-m", "swarm.replay", str(tmp_path / "s"), "--engines", engines,
+                    "--lmcache-metrics", lmc, "--time-scale", "0.01", "--idle-scale", "0.002",
+                    "--metrics-interval", "0.05", "-o", str(out)], cwd=ROOT, check=True, timeout=120)
+    assert (out / "metrics_timeseries.jsonl").stat().st_size > 0
+    (out / "config.env").write_text("L1_SIZE_GB=1\nCHUNK_SIZE=256\nCACHE_MODE=blend\nL2_BACKEND=valkey\n")
+    (out / "valkey_before.json").write_text('{"evicted_keys": 5}')
+    (out / "valkey_after.json").write_text('{"evicted_keys": 5}')
+    row = summarize.summarize(out, ttft_target=5.0, recompute_ratio=0.15)
+    assert row["l1_gb"] == 1.0 and row["chunk"] == 256 and row["move_prob"] == 1.0
+    assert row["valkey_evicted_keys"] == 0 and row["leg"] == "blend+valkey"
+    assert row["idle_gaps"] and all(g["stored_tokens"] >= 0 for g in row["idle_gaps"])
+    assert sum(v["requests"] for v in row["idle_gap_pressure"].values()) == len(row["idle_gaps"])

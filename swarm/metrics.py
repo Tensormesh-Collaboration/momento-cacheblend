@@ -25,6 +25,7 @@ LMCACHE = {
     "prompt": "lmcache_mp_lookup_prompt",                 # whole prompt length
     "request_hit": "lmcache_mp_lookup_request_hit",       # prefix served by engine cache or LMCache
     "l1_evicted": "lmcache_mp_l1_evicted",
+    "l1_write": "lmcache_mp_l1_write",                    # chunks stored into L1
     "l2_loaded": "lmcache_mp_l2_prefetch_load_completed",
     "l2_stored": "lmcache_mp_l2_store_completed_objects",
     "blend_requested": "lmcache_blend_lookup_requested_tokens",

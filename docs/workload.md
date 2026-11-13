@@ -107,3 +107,24 @@ GPU smoke test at each size: `scripts/chunk_smoke.sh --legs "B D"` (one worker,
 boots each size, checks that CacheBlend reuses a shifted body). Throughput
 needs `run_leg.sh` with `CHUNK_SIZE` set; quality needs `lmcache bench quality`
 at each size before 128 or 64 is used for a measured result.
+
+## Idle gaps and worker moves
+
+An idle gap only costs something if the agent's KV is evicted while it waits,
+and LMCache evicts the least recently used KV, not the oldest. So the simulator
+and the summary group every request after an idle gap by eviction pressure:
+tokens the agent's old worker stored into L1 during the gap, divided by its L1
+size. Below 0.25 the agent's KV is very likely still there; at 1 or more, its old
+worker turned over all of L1.
+
+Worker moves draw from their own random stream, so a sweep
+(`--move-prob 0,0.5,1`) changes nothing but which agents move. On the
+sub-agent schedule (8 × 5, 5-minute gaps, 8 GiB L1), 20 of 23 gaps had pressure
+of 1 or more: the old worker had already lost the agent's KV, so moving cost
+nothing extra and A to D barely changed with the move probability. Moves only
+matter when L1 is large enough to survive the gap. At 64 GiB per worker, all
+gaps fell below pressure 1, and moving every agent after its gap (q = 1 against
+q = 0) cut A from 85.2% to 81.4% of tokens skipped; its post-gap requests fell
+from 87-97% served to 39-68%. C stayed at 85.4% because those agents found their
+KV in Valkey. That is the regime where the optional move sweep shows Valkey's
+cross-worker value.

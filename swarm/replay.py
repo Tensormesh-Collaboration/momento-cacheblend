@@ -15,6 +15,10 @@ Writes to the output directory:
 
     requests.jsonl   one line per request (TTFT, latency, tokens, worker, ...)
     metrics.json     LMCache and vLLM counter deltas per worker over the run
+    metrics_timeseries.jsonl
+                     every --metrics-interval seconds, each worker's LMCache
+                     counters (L1 stores and evictions, ...): what summarize
+                     uses to measure the eviction pressure during idle gaps
     run.json         arguments, schedule meta, start and end time
 """
 
@@ -73,10 +77,30 @@ async def agent_loop(ag: schedule.Agent, clients: list, model: str, a, t_start: 
         r = await send(clients[w], model, ag.request(k), turn.max_tokens, a.timeout)
         r.update(agent=ag.agent, dev=ag.dev, turn=k, worker=w, moved=turn.moved,
                  after_idle=bool(k and ag.turns[k - 1].idle_s), t_submit_s=round(t_submit, 3),
-                 max_tokens=turn.max_tokens)
+                 t_end_s=round(time.perf_counter() - t_start, 3), max_tokens=turn.max_tokens)
         sink(r)
         if k + 1 < len(ag.turns):
             await asyncio.sleep(min(a.gap_cap, turn.after_s) * a.time_scale + turn.idle_s * a.idle_scale)
+
+
+async def sample_metrics(lmc: list[str], interval: float, t_start: float, path: Path, stop: asyncio.Event) -> None:
+    """Every `interval` seconds, append each worker's named LMCache counters."""
+    if not lmc or interval <= 0:
+        return
+    with open(path, "w") as f:
+        while True:
+            t = round(time.perf_counter() - t_start, 3)
+            snaps = await asyncio.gather(*(asyncio.to_thread(metrics.scrape, u, "lmcache") for u in lmc))
+            for w, snap in enumerate(snaps):
+                if snap is not None:
+                    f.write(json.dumps({"t_s": t, "worker": w, **metrics.named(snap, metrics.LMCACHE)}) + "\n")
+            f.flush()
+            if stop.is_set():
+                return
+            try:
+                await asyncio.wait_for(stop.wait(), interval)
+            except asyncio.TimeoutError:
+                pass
 
 
 def scrape_all(engines: list[str], lmc: list[str]) -> list[dict]:
@@ -124,7 +148,11 @@ async def main_async(a) -> None:
 
     t_start = time.perf_counter()
     wall_start = time.time()
+    stop = asyncio.Event()
+    sampler = asyncio.create_task(sample_metrics(lmc, a.metrics_interval, t_start, out / "metrics_timeseries.jsonl", stop))
     await asyncio.gather(*(agent_loop(ag, clients, model, a, t_start, sink) for ag in agents))
+    stop.set()
+    await sampler
     f.close()
     after = await asyncio.to_thread(scrape_all, engines, lmc)
     per_worker = []
@@ -155,6 +183,8 @@ def main() -> None:
     ap.add_argument("--idle-scale", type=float, default=1.0, help="multiply idle gaps (0 removes them)")
     ap.add_argument("--gap-cap", type=float, default=120.0, help="cap on one tool gap, s (before scaling)")
     ap.add_argument("--timeout", type=float, default=900.0)
+    ap.add_argument("--metrics-interval", type=float, default=5.0,
+                    help="seconds between LMCache counter samples (0 = off)")
     ap.add_argument("--limit-agents", type=int, default=0)
     ap.add_argument("-o", "--output", required=True)
     asyncio.run(main_async(ap.parse_args()))

@@ -33,6 +33,7 @@ setup.sh start.sh stop.sh   from netapp-cacheblend; start/stop handle several wo
 run_leg.sh            one leg from a clean cache: start workers, replay, collect, stop
 scripts/              launch (one worker), entrypoint (in the container), preflight,
                       verify, stage-plugin, smoke_cb.py (does blending fire?), chunk_smoke.sh,
+                      sweep.sh (grid of legs),
                       valkey.py (ping/info/count/blob/wipe), coordinator.sh
 swarm/                the workload: generate, simulate, replay, summarize
 tests/                offline tests and a CPU mock of the serving stack
@@ -55,6 +56,20 @@ python3 -m swarm.generate --data data/swesmith --repo getmoto__moto --devs 8 --a
 # Preview A-D offline: where each input token would come from, per L1 size
 python3 -m swarm.simulate schedules/moto-8x5-sub --l1-gb 8,32 --fleet-blend
 ```
+
+Sweeps (design decisions 7, 9, 10):
+
+- **L1 per worker** is the one capacity axis: `--l1-gb 8,16,32`. Keep it below
+  the working set so C and D spill to Valkey; A and B evict and recompute. The
+  `L2 peak` column is the Valkey capacity the run needed: provision more than
+  that, so Valkey never becomes the limit.
+- **Idle-gap eviction pressure**: requests right after an idle gap are grouped
+  by how much the agent's old worker stored into L1 while it waited (as a
+  fraction of L1), with the share of their tokens still served from cache.
+- **Worker-move probability** (optional): `swarm.generate ... --move-prob 0,0.5,1`
+  writes `<output>-q0`, `-q0.5`, `-q1`, identical except for which agents move
+  after idle gaps (the moves at 0.5 are a subset of those at 1). Pass all three
+  to `swarm.simulate`, which accepts several schedules.
 
 Chunk size is a sweep axis too: `--chunk-size 256,128,64` (the default is 256,
 CacheBlend's validated size; results and caveats in [docs/workload.md](docs/workload.md)).
@@ -109,6 +124,21 @@ Each leg starts from empty caches, runs the whole schedule, and leaves
 `runs/<timestamp>-<leg>/` with `requests.jsonl` (per request: TTFT, latency,
 tokens, worker, whether it followed an idle gap or a move), `metrics.json`
 (LMCache and vLLM counter deltas per worker), `config.env` and each worker's logs.
+
+For grids, `scripts/sweep.sh` runs every cell from empty caches and writes one
+summary table, e.g. the optional worker-move sweep:
+
+```bash
+scripts/sweep.sh --schedules "schedules/sub-q0 schedules/sub-q0.5 schedules/sub-q1" \
+    --legs "C D" --l1 "22" --name moves
+```
+
+The summary adds, per run: the sweep coordinates (L1, chunk, move
+probability), Valkey's own evictions during the leg (`valkey_evicted_keys`,
+from `scripts/valkey.py stats` before and after; anything above 0 means Valkey's
+capacity limited the run), and an idle-gap table: requests after a gap grouped by
+the eviction pressure on the agent's old worker, from the LMCache counters the
+replay samples every 5 s (`metrics_timeseries.jsonl`).
 
 For the chunk-size sweep on GPUs, first boot and smoke-test each size
 (`scripts/chunk_smoke.sh --legs "B D"`), then run legs with it set, e.g.

@@ -68,6 +68,8 @@ def area_of(s: corpus.Session) -> str:
 
 
 def build(a: argparse.Namespace) -> None:
+    """Write one schedule (a single --move-prob value; main() loops over a list)."""
+    a.move_prob = float(a.move_prob)
     tok = Tokenizer(a.tokenizer)
     paths = sorted(Path(a.data).glob("tool-*.parquet"))
     if a.download_shards:
@@ -100,6 +102,11 @@ def build(a: argparse.Namespace) -> None:
         harness += "\n\n" + filler(a.harness_tokens - base_tokens, tok, 0, "## Workspace conventions")
 
     gap = timing.parse(a.gap)
+    # Worker moves draw from their own stream, one draw per idle gap whatever the
+    # move probability, so schedules built with different --move-prob values are
+    # identical except for which agents move (and the moves at a lower
+    # probability are a subset of those at a higher one).
+    move_rng = random.Random(a.seed * 7919 + 17)
     placeholder_tokens = len(tok.message("user", schedule.CLEARED_TEXT))
     agents: list[schedule.Agent] = []
     for d, group in enumerate(groups):
@@ -142,8 +149,11 @@ def build(a: argparse.Namespace) -> None:
                 idle = a.idle_s if (k + 1 < len(turns_idx) and rng.random() < a.idle_prob) else 0.0
                 turns.append(schedule.Turn(msg=ti, max_tokens=out_tokens, worker=worker,
                                            after_s=round(gap(rng), 3), idle_s=idle, cleared=sorted(cleared)))
-                if idle and a.workers > 1 and rng.random() < a.move_prob:
-                    worker = rng.choice([w for w in range(a.workers) if w != worker])
+                if idle and a.workers > 1:
+                    u = move_rng.random()
+                    target = move_rng.choice([w for w in range(a.workers) if w != worker])
+                    if u < a.move_prob:
+                        worker = target
             for k in range(1, len(turns)):
                 turns[k].moved = turns[k].worker != turns[k - 1].worker
             start = round(d * a.dev_stagger + rng.uniform(0, a.agent_stagger), 3)
@@ -170,6 +180,7 @@ def build(a: argparse.Namespace) -> None:
         "requests": len(lens),
         "prompt_tokens": {"p50": lens[len(lens) // 2], "p90": lens[int(0.9 * (len(lens) - 1))],
                           "max": lens[-1], "mean": round(statistics.mean(lens))},
+        "move_prob": a.move_prob,
         "idle_gaps": sum(1 for ag in agents for t in ag.turns if t.idle_s),
         "moves": sum(1 for ag in agents for t in ag.turns if t.moved),
     }
@@ -206,7 +217,9 @@ def parser() -> argparse.ArgumentParser:
     g.add_argument("--idle-prob", type=float, default=0.1)
     g.add_argument("--idle-s", type=float, default=300.0)
     g.add_argument("--workers", type=int, default=2)
-    g.add_argument("--move-prob", type=float, default=0.5, help="chance an agent changes worker after an idle gap")
+    g.add_argument("--move-prob", default="0.5",
+                   help="chance an agent changes worker after an idle gap; comma-separated (e.g. 0,0.5,1) "
+                        "writes one schedule per value, <output>-q<value>, identical except for the moves")
     g.add_argument("--dev-stagger", type=float, default=30.0)
     g.add_argument("--agent-stagger", type=float, default=20.0)
     ap.add_argument("--seed", type=int, default=0)
@@ -215,7 +228,13 @@ def parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    build(parser().parse_args())
+    a = parser().parse_args()
+    qs = [float(x) for x in str(a.move_prob).split(",")]
+    base = a.output
+    for q in qs:
+        a.move_prob = q
+        a.output = base if len(qs) == 1 else f"{base}-q{q:g}"
+        build(a)
 
 
 if __name__ == "__main__":
