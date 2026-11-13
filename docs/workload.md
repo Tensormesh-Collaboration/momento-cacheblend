@@ -71,3 +71,39 @@ What it says, before any GPU time:
 
 The simulator has no queueing, no vLLM GPU prefix cache, and an idealized
 LRU; treat it as a way to pick the legs worth running, not as results.
+
+## Chunk size: 256, 128, 64
+
+`python3 -m swarm.simulate <schedule> --chunk-size 256,128,64`. Same
+schedules and assumptions as above; the share of input tokens served by
+CacheBlend (non-prefix hits), and what D still computes:
+
+| Schedule, L1 / worker | Non-prefix, B (256 → 128 → 64) | Non-prefix, D | New tokens, D | D's CacheBlend tokens from matches < 256 at chunk 64 |
+|---|---|---|---|---|
+| Long sessions, 8 GiB | 7.4 → 7.8 → 8.1 | 0.8 → 1.0 → 1.1 | 2.7 → 2.4 → 2.2 | 13.8% |
+| Long sessions, 32 GiB | 1.8 → 2.0 → 2.1 | 0.9 → 1.0 → 1.1 | 2.7 → 2.4 → 2.2 | 13.8% |
+| Sub-agents, 8 GiB | 12.8 → 12.9 → 13.0 | 8.0 → 8.2 → 8.4 | 6.5 → 6.1 → 5.8 | 1.7% |
+| Tool-result clearing, 8 GiB | 2.2 → 2.6 → 2.9 | 1.9 → 2.2 → 2.4 | 4.8 → 4.2 → 3.8 | 12.9% |
+
+Why the gain is small and where it comes from: a stored prompt is cut into
+chunks from its first token, so a reused span of L tokens keeps on average
+L − C + 1 of them (it loses the partial chunks at its edges). A 2,500-token
+file keeps ~90% at 256, ~95% at 128, ~97.5% at 64; a 600-token span keeps
+~57%, ~79%, ~90%. Most reusable text here sits in long spans (whole files,
+bundles), so halving the chunk adds a few percent to CacheBlend's share; where
+spans are shorter and more numerous (cleared histories) it adds up to a third.
+At 64, matches shorter than 256 tokens appear (in D, 13-14% of CacheBlend's
+tokens in the long-session and clearing schedules, under 2% with sub-agents):
+boilerplate and partial file views, the short spans the CacheBlend error model
+says reuse least accurately.
+
+What smaller chunks cost (none of it is in the simulator): 2x / 4x more stored
+objects and lookups per token, 12 / 6 MiB values instead of 24 MiB through
+Valkey and RDMA, and the local matcher's 2^20-chunk table fills 4x sooner
+(67M stored tokens per server at 64). The table was never close in these runs
+(at most ~9K chunks per worker).
+
+GPU smoke test at each size: `scripts/chunk_smoke.sh --legs "B D"` (one worker,
+boots each size, checks that CacheBlend reuses a shifted body). Throughput
+needs `run_leg.sh` with `CHUNK_SIZE` set; quality needs `lmcache bench quality`
+at each size before 128 or 64 is used for a measured result.

@@ -256,13 +256,19 @@ validate_config() {
   case "${VALKEY_KEY_PREFIX:-}" in *@*) errs+=("VALKEY_KEY_PREFIX must not contain '@'") ;; esac
   [[ "${VALKEY_TTL_S:-}" =~ ^[0-9]*$ ]] || errs+=("VALKEY_TTL_S='${VALKEY_TTL_S}' must be empty or a whole number")
   if [ "${L2_BACKEND:-}" = valkey ] && [ -z "${VALKEY_NODES:-}" ]; then errs+=("L2_BACKEND=valkey needs VALKEY_NODES=host:port"); fi
-  if [[ "${L1_ALIGN_BYTES:-}" =~ ^[0-9]+$ ]] && [ $(( 25165824 % L1_ALIGN_BYTES )) -ne 0 ] && [[ "${HF_REPO:-}" == *Qwen3-Coder-30B* ]]; then
-    errs+=("L1_ALIGN_BYTES=${L1_ALIGN_BYTES} does not divide Qwen3-Coder-30B's 24 MiB chunk: every chunk would be padded (use 8388608)")
+  # L1 pads every chunk up to the alignment, so it must divide the chunk's bytes.
+  # Qwen3-Coder-30B-A3B: 96 KiB per token -> 24 / 12 / 6 MiB at 256 / 128 / 64 tokens.
+  if [[ "${L1_ALIGN_BYTES:-}" =~ ^[0-9]+$ ]] && [[ "${CHUNK_SIZE:-}" =~ ^[0-9]+$ ]] && [[ "${HF_REPO:-}" == *Qwen3-Coder-30B* ]] \
+     && [ $(( 98304 * CHUNK_SIZE % L1_ALIGN_BYTES )) -ne 0 ]; then
+    errs+=("L1_ALIGN_BYTES=${L1_ALIGN_BYTES} does not divide Qwen3-Coder-30B's $(( 98304 * CHUNK_SIZE / 1048576 )) MiB chunk at CHUNK_SIZE=${CHUNK_SIZE}: every chunk would be padded (2097152 divides all of 64/128/256)")
   fi
   if [ "${L2_ODIRECT:-0}" = 1 ] && [[ "${L1_ALIGN_BYTES:-0}" =~ ^[0-9]+$ ]] && [ "${L1_ALIGN_BYTES}" -lt 4096 ]; then
     errs+=("L2_ODIRECT=1 needs L1_ALIGN_BYTES >= 4096")
   fi
-  [ "${CHUNK_SIZE:-256}" = 256 ] || errs+=("CHUNK_SIZE must stay 256 (CacheBlend's validated reuse granularity)")
+  # 256 is CacheBlend's validated granularity; 128 and 64 are for the chunk-size
+  # sweep (scripts/chunk_smoke.sh). The plugin's block size is 64, and the chunk
+  # must be a whole number of blocks.
+  case "${CHUNK_SIZE:-}" in 64|128|256) ;; *) errs+=("CHUNK_SIZE='${CHUNK_SIZE:-}' must be 64, 128 or 256") ;; esac
   if [ ${#errs[@]} -gt 0 ]; then
     echo "FATAL: invalid settings in cacheblend.env / profiles / cacheblend.env.local:" >&2
     printf '  - %s\n' "${errs[@]}" >&2

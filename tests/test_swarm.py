@@ -246,3 +246,16 @@ def test_smoke_cb(blend, expect):
         assert ("PASS" if blend else "FAIL") in r.stdout
     finally:
         proc.terminate()
+
+
+def test_simulator_smaller_chunks_recover_span_edges():
+    # A shared span at an offset that is not a multiple of any chunk size: the
+    # stored copy loses its partial edge chunks, and finer chunks lose less.
+    rng = random.Random(4)
+    shared = "".join(rng.choice("abcdefghij") for _ in range(1000))
+    a1 = _agent("x", 0, ["p" * 37 + shared], start=0.0)
+    a2 = _agent("y", 1, ["different preamble " * 9 + shared], start=10.0)
+    p = simulate.Prompts(Tokenizer("chars"), [a1, a2])
+    got = {c: simulate.run(p, "B", 1, 0, 0, False, 1e9, 1e9, chunk=c)["totals"].get("blend_l1", 0) for c in (256, 128, 64)}
+    assert 0 < got[256] <= got[128] <= got[64] <= 1000
+    assert got[64] > got[256]

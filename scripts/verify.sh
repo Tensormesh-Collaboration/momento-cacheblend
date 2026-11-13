@@ -41,7 +41,7 @@ if [ "${CACHE_MODE}" = blend ]; then
   chk "blend module loaded (/status has active_cb_lookups)" \
       "curl -sf http://127.0.0.1:${HTTP}/status | grep -q active_cb_lookups"
   chk "CacheBlend reuses a shifted body (non-prefix hits > 0)" \
-      "python3 '${KIT_DIR}/scripts/smoke_cb.py' --port ${PORT} --metrics http://127.0.0.1:${HTTP}/metrics"
+      "python3 '${KIT_DIR}/scripts/smoke_cb.py' --port ${PORT} --metrics http://127.0.0.1:${HTTP}/metrics --chunk ${CHUNK_SIZE}"
   grep -h 'CB: auto-selected\|CB: preferring kv cache block size\|CB: turned off' "$L/vllm.log" 2>/dev/null | tail -3 || true
 fi
 

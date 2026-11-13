@@ -12,8 +12,10 @@ configuration, where each input token would have come from:
 
 Model:
 
-* A stored prompt becomes chunks of 256 tokens counted from its first token,
-  each keyed by a prefix-chained hash and indexed by its content.
+* A stored prompt becomes chunks of --chunk-size tokens (default 256; sweep
+  64,128,256) counted from its first token, each keyed by a prefix-chained hash
+  and indexed by its content. Capacity in GiB becomes chunks at
+  --kv-bytes-per-token x chunk size.
 * Prefix lookup walks the chain from the start, through L1 then L2, and stops
   at the first missing chunk (LMCache's lookup_hit = L1 part + L2 part).
 * CacheBlend lookup then probes every token offset past the prefix for a
@@ -92,7 +94,7 @@ class Prompts:
 
 
 def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: int,
-        fleet_blend: bool, prefill_tps: float, decode_tps: float) -> dict:
+        fleet_blend: bool, prefill_tps: float, decode_tps: float, chunk: int = CHUNK) -> dict:
     mode, valkey = CONFIGS[config]
     agents = prompts.agents
     l1 = [LRU(l1_chunks) for _ in range(workers)]
@@ -103,6 +105,8 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
     tot: Counter = Counter()
     by_kind: dict[str, Counter] = defaultdict(Counter)
     per_agent_skip = Counter()
+    stored_keys: list[set[int]] = [set() for _ in range(workers)]  # what each local matcher indexed
+    runs: list[int] = []  # lengths (tokens) of contiguous CacheBlend matches
     events = [(a.start_s, ai, 0) for ai, a in enumerate(agents)]
     heapq.heapify(events)
     while events:
@@ -112,7 +116,7 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
         w = turn.worker % workers
         T = prompts.tokens(ai, k)
         L = len(T)
-        contents = aligned_chunk_hashes(T)
+        contents = aligned_chunk_hashes(T, chunk)
         keys, c = [], 0
         for h in contents:
             c = chain(c, h)
@@ -129,17 +133,18 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
                 p2 += 1
             else:
                 break
-        pre = (p1 + p2) * CHUNK
+        pre = (p1 + p2) * chunk
         hit_keys = keys[: p1 + p2]
         # --- CacheBlend lookup ------------------------------------------------
         b1 = b2 = 0
         src: Counter = Counter()
-        if mode == "blend" and L - pre >= CHUNK:
-            wh = window_hashes(T)
+        if mode == "blend" and L - pre >= chunk:
+            wh = window_hashes(T, chunk)
             index = fleet_index if fleet_blend else local_index[w]
             i = pre
             whl = wh.tolist()
             n = len(whl)
+            run_start = run_end = -1
             while i < n:
                 cands = index.get(whl[i])
                 found = None
@@ -158,12 +163,20 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
                             b2 += 1
                         hit_keys.append(key)
                         o = owner.get(key)
-                        src["own" if o == (ag.dev, ai) else "same_dev" if o and o[0] == ag.dev else "other_dev"] += CHUNK
-                        i += CHUNK
+                        src["own" if o == (ag.dev, ai) else "same_dev" if o and o[0] == ag.dev else "other_dev"] += chunk
+                        if i != run_end:
+                            if run_end > run_start >= 0:
+                                runs.append(run_end - run_start)
+                            run_start = i
+                        i += chunk
+                        run_end = i
                         continue
                 i += 1
+            if run_end > run_start >= 0:
+                runs.append(run_end - run_start)
         # --- accounting -------------------------------------------------------
-        r = {"prefix_l1": p1 * CHUNK, "prefix_l2": p2 * CHUNK, "blend_l1": b1 * CHUNK, "blend_l2": b2 * CHUNK}
+        r = {"prefix_l1": p1 * chunk, "prefix_l2": p2 * chunk, "blend_l1": b1 * chunk, "blend_l2": b2 * chunk,
+             "blend_chunks_loaded": b1 + b2}
         r["new"] = L - sum(r.values())
         r["tokens"] = L
         for kk, v in src.items():
@@ -182,14 +195,22 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
             if l2 is not None:
                 l2.touch(key)
             local_index[w][h].add(key)
+            stored_keys[w].add(key)
             fleet_index[h].add(key)
             owner.setdefault(key, (ag.dev, ai))
         # --- next turn -------------------------------------------------------------
         service = r["new"] / prefill_tps + turn.max_tokens / decode_tps
         if k + 1 < len(ag.turns):
             heapq.heappush(events, (now + service + turn.after_s + turn.idle_s, ai, k + 1))
-    return {"config": config, "totals": dict(tot), "by_kind": {k: dict(v) for k, v in by_kind.items()},
-            "l1_evicted_chunks": sum(x.evicted for x in l1), "l2_evicted_chunks": l2.evicted if l2 else 0}
+    blend_tok = sum(runs) or 1
+    return {"config": config, "chunk": chunk, "totals": dict(tot), "by_kind": {k: dict(v) for k, v in by_kind.items()},
+            "l1_evicted_chunks": sum(x.evicted for x in l1), "l2_evicted_chunks": l2.evicted if l2 else 0,
+            # The local matcher's table holds 2^20 chunks per server lifetime; past
+            # that, new content can no longer be blended (LMCache blend_counters.py).
+            "max_chunks_indexed_per_worker": max(len(x) for x in stored_keys),
+            "blend_runs": len(runs),
+            "blend_tokens_in_runs_under_256": round(100 * sum(x for x in runs if x < 256) / blend_tok, 1),
+            "blend_tokens_in_runs_under_512": round(100 * sum(x for x in runs if x < 512) / blend_tok, 1)}
 
 
 def turn_moved(ag: schedule.Agent, k: int) -> bool:
@@ -219,6 +240,7 @@ def main() -> None:
     ap.add_argument("--prefill-tps", type=float, default=20000.0)
     ap.add_argument("--decode-tps", type=float, default=60.0)
     ap.add_argument("--recompute-ratio", type=float, default=0.15)
+    ap.add_argument("--chunk-size", default="256", help="tokens per chunk; comma-separated to sweep (e.g. 64,128,256)")
     ap.add_argument("--tokenizer", default="", help="default: the schedule's")
     ap.add_argument("-o", "--output", type=Path, help="write results JSON here")
     a = ap.parse_args()
@@ -226,25 +248,30 @@ def main() -> None:
     tok = Tokenizer(a.tokenizer or meta.get("tokenizer"))
     workers = a.workers or meta["args"].get("workers", 1)
     prompts = Prompts(tok, agents)
-    chunk_bytes = a.kv_bytes_per_token * CHUNK
     results = []
     print(f"{meta['repo']}: {len(agents)} agents, {meta['requests']} requests, {workers} workers, "
-          f"chunk {chunk_bytes / 2**20:.0f} MiB, tokenizer {tok.name}")
-    hdr = f"{'L1/wkr':>7} {'cfg':>3} {'pfx L1':>7} {'pfx L2':>7} {'blnd L1':>7} {'blnd L2':>7} {'new':>6} {'skipped':>8} {'blend<-others':>13}"
-    print(hdr)
-    for l1_gb in [float(x) for x in a.l1_gb.split(",")]:
-        l1_chunks = int(l1_gb * 2**30 // chunk_bytes)
-        l2_chunks = int(a.l2_gb * 2**30 // chunk_bytes)
-        for cfg in a.configs:
-            res = run(prompts, cfg, workers, l1_chunks, l2_chunks, a.fleet_blend and cfg == "D",
-                      a.prefill_tps, a.decode_tps)
-            res.update(l1_gb=l1_gb, l2_gb=a.l2_gb, shares=shares(res["totals"], a.recompute_ratio),
-                       shares_by_kind={k: shares(v, a.recompute_ratio) for k, v in res["by_kind"].items()})
-            s = res["shares"]
-            print(f"{l1_gb:>7g} {cfg:>3} {s['prefix_l1']:>7} {s['prefix_l2']:>7} {s['blend_l1']:>7} "
-                  f"{s['blend_l2']:>7} {s['new']:>6} {s['skipped']:>8} {s['blend_other_agents']:>13}")
-            results.append(res)
-    print("(% of input tokens; skipped = prefix + blend x (1 - recompute ratio))")
+          f"KV {a.kv_bytes_per_token / 1024:.0f} KiB/token, tokenizer {tok.name}")
+    print(f"{'chunk':>5} {'L1/wkr':>7} {'cfg':>3} {'pfx L1':>7} {'pfx L2':>7} {'blnd L1':>7} {'blnd L2':>7} "
+          f"{'new':>6} {'skipped':>8} {'blend<-others':>13} {'blend<256':>9} {'idx/wkr':>8}")
+    for chunk in [int(x) for x in a.chunk_size.split(",")]:
+        chunk_bytes = a.kv_bytes_per_token * chunk
+        for l1_gb in [float(x) for x in a.l1_gb.split(",")]:
+            l1_chunks = int(l1_gb * 2**30 // chunk_bytes)
+            l2_chunks = int(a.l2_gb * 2**30 // chunk_bytes)
+            for cfg in a.configs:
+                res = run(prompts, cfg, workers, l1_chunks, l2_chunks, a.fleet_blend and cfg == "D",
+                          a.prefill_tps, a.decode_tps, chunk)
+                res.update(l1_gb=l1_gb, l2_gb=a.l2_gb, chunk_bytes=chunk_bytes,
+                           shares=shares(res["totals"], a.recompute_ratio),
+                           shares_by_kind={k: shares(v, a.recompute_ratio) for k, v in res["by_kind"].items()})
+                s = res["shares"]
+                short = f"{res['blend_tokens_in_runs_under_256']:>8}%" if res["blend_runs"] else f"{'-':>9}"
+                print(f"{chunk:>5} {l1_gb:>7g} {cfg:>3} {s['prefix_l1']:>7} {s['prefix_l2']:>7} {s['blend_l1']:>7} "
+                      f"{s['blend_l2']:>7} {s['new']:>6} {s['skipped']:>8} {s['blend_other_agents']:>13} "
+                      f"{short} {res['max_chunks_indexed_per_worker']:>8}")
+                results.append(res)
+    print("(% of input tokens; skipped = prefix + blend x (1 - recompute ratio); blend<256 = share of CacheBlend "
+          "tokens in matches shorter than 256 tokens; idx/wkr = chunks a local matcher indexed, cap 2^20)")
     if a.output:
         a.output.write_text(json.dumps({"meta": meta, "args": vars(a) | {"schedule": str(a.schedule), "output": str(a.output)},
                                         "results": results}, indent=2, default=str))

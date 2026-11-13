@@ -32,7 +32,7 @@ configs/{A,B,C,D}.env the four legs: reuse mode x L2 backend
 setup.sh start.sh stop.sh   from netapp-cacheblend; start/stop handle several workers
 run_leg.sh            one leg from a clean cache: start workers, replay, collect, stop
 scripts/              launch (one worker), entrypoint (in the container), preflight,
-                      verify, stage-plugin, smoke_cb.py (does blending fire?),
+                      verify, stage-plugin, smoke_cb.py (does blending fire?), chunk_smoke.sh,
                       valkey.py (ping/info/count/blob/wipe), coordinator.sh
 swarm/                the workload: generate, simulate, replay, summarize
 tests/                offline tests and a CPU mock of the serving stack
@@ -55,6 +55,9 @@ python3 -m swarm.generate --data data/swesmith --repo getmoto__moto --devs 8 --a
 # Preview A-D offline: where each input token would come from, per L1 size
 python3 -m swarm.simulate schedules/moto-8x5-sub --l1-gb 8,32 --fleet-blend
 ```
+
+Chunk size is a sweep axis too: `--chunk-size 256,128,64` (the default is 256,
+CacheBlend's validated size; results and caveats in [docs/workload.md](docs/workload.md)).
 
 Every agent replays one recorded SWE-smith session, teacher-forced; the swarm
 around it (developers, harness prompt, preambles, bundles, context clearing,
@@ -106,6 +109,11 @@ Each leg starts from empty caches, runs the whole schedule, and leaves
 `runs/<timestamp>-<leg>/` with `requests.jsonl` (per request: TTFT, latency,
 tokens, worker, whether it followed an idle gap or a move), `metrics.json`
 (LMCache and vLLM counter deltas per worker), `config.env` and each worker's logs.
+
+For the chunk-size sweep on GPUs, first boot and smoke-test each size
+(`scripts/chunk_smoke.sh --legs "B D"`), then run legs with it set, e.g.
+`CHUNK_SIZE=64 ./run_leg.sh D --schedule ... --label c64`. Only 256 is validated
+for quality; check 128 and 64 with `lmcache bench quality` before reporting them.
 
 `TIME_SCALE` and `IDLE_SCALE` shrink the schedule's gaps for quick runs; the
 cache only sees the order and overlap of requests, but eviction during idle
