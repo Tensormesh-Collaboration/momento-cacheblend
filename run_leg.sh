@@ -65,8 +65,11 @@ for w in $(worker_ids); do
   ENGINES+="${ENGINES:+,}http://127.0.0.1:$(worker_port "$w")"
   METRICS+="${METRICS:+,}http://127.0.0.1:$(worker_http_port "$w")/metrics"
 done
-env | grep -E '^(CACHE_MODE|L2_|VALKEY_|L1_|CHUNK_SIZE|WORKERS|GPUS_PER_WORKER|HOST_GPUS|TM_VERSION|ENGINE_TAG|HF_REPO|MAX_MODEL_LEN|MAX_NUM_SEQS|FLAG_MATCHED|ENABLE_APC|CB_|COORDINATOR_URL|TIME_SCALE|IDLE_SCALE)=' \
-  | grep -v PASSWORD | sort > "${OUT}/config.env"
+# Every setting, exported or not (load_env sets most without exporting them).
+for v in $(compgen -v | grep -E '^(CACHE_MODE|L2_|VALKEY_|L1_|CHUNK_SIZE|WORKERS|GPUS_PER_WORKER|HOST_GPUS|GPU_MEM_UTIL|TM_VERSION|ENGINE_TAG|HF_REPO|MAX_MODEL_LEN|MAX_NUM_SEQS|FLAG_MATCHED|ENABLE_APC|CB_|COORDINATOR_URL|TIME_SCALE|IDLE_SCALE|EVICTION_|MAX_REQUEST_TOKENS)' \
+         | grep -v PASSWORD | sort); do
+  printf '%s=%s\n' "$v" "${!v}"
+done > "${OUT}/config.env"
 
 # Valkey's own counters around the replay: its evicted_keys must not grow, or
 # Valkey's capacity, not L1, limited the leg (design decision 7).

@@ -43,9 +43,21 @@ sys.exit(0 if have >= need else 1)
 PY
     then
       if [ "${VALKEY_PIP_INSTALL:-0}" = 1 ]; then
-        echo "installing valkey-glide-sync>=${GLIDE_MIN} into the engine image ..."
-        /opt/venv/bin/python -m pip install -q "valkey-glide-sync>=${GLIDE_MIN}" \
-          || { echo "FATAL: pip install valkey-glide-sync failed (no network from the container?)"; exit 1; }
+        # The v0.5.8rc1 image runs as uid 1000 with a root-owned venv and no pip
+        # in it, so install into a private directory with uv (shipped in the
+        # image) and put it on PYTHONPATH; pip into the venv where that works.
+        echo "installing valkey-glide-sync>=${GLIDE_MIN} ..."
+        if [ -w /opt/venv/lib ] && /opt/venv/bin/python -m pip --version >/dev/null 2>&1; then
+          /opt/venv/bin/python -m pip install -q "valkey-glide-sync>=${GLIDE_MIN}" \
+            || { echo "FATAL: pip install valkey-glide-sync failed (no network from the container?)"; exit 1; }
+        else
+          PYDEPS=/tmp/momento-pydeps
+          command -v uv >/dev/null || { echo "FATAL: no writable pip and no uv in the image: bake valkey-glide-sync into it"; exit 1; }
+          uv pip install --quiet --python /opt/venv/bin/python --target "${PYDEPS}" "valkey-glide-sync>=${GLIDE_MIN}" \
+            || { echo "FATAL: uv pip install valkey-glide-sync failed (no network from the container?)"; exit 1; }
+          export PYTHONPATH="${PYTHONPATH:+${PYTHONPATH}:}${PYDEPS}"
+        fi
+        /opt/venv/bin/python -c 'import glide_sync' || { echo "FATAL: valkey-glide-sync installed but not importable"; exit 1; }
       else
         echo "FATAL: the engine image lacks valkey-glide-sync>=${GLIDE_MIN}. Set VALKEY_PIP_INSTALL=1, or bake it into the image."
         exit 1
@@ -161,8 +173,8 @@ echo "=== starting lmcache server: mode=${CACHE_MODE:-blend} (engine ${ENGINE_TY
   "${L1_ARGS[@]}" \
   --l1-align-bytes "${L1_ALIGN_BYTES}" \
   --eviction-policy LRU \
-  --eviction-trigger-watermark 0.8 \
-  --eviction-ratio 0.2 \
+  --eviction-trigger-watermark "${EVICTION_WATERMARK:-0.8}" \
+  --eviction-ratio "${EVICTION_RATIO:-0.2}" \
   ${L2_ARGS[@]+"${L2_ARGS[@]}"} \
   ${COORD_ARGS[@]+"${COORD_ARGS[@]}"} \
   > "$LOG/lmcache-server.log" 2>&1 &

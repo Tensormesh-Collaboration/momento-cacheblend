@@ -75,8 +75,15 @@ def delta(before: dict | None, after: dict | None) -> dict[str, float]:
 
 
 def counter(d: dict[str, float], stem: str) -> float | None:
-    vals = [v for k, v in d.items() if any(k == stem + s for s in SUFFIXES)]
-    return sum(vals) if vals else None
+    """The first series named stem + suffix, in SUFFIXES order (tokens before chunks and keys).
+
+    v0.5.8rc1 exports some instruments in two units, e.g. lookup_hit_l1 as both
+    `..._l1_tokens_total` and `..._l1_keys_total`: summing them mixes units.
+    """
+    for s in SUFFIXES:
+        if stem + s in d:
+            return d[stem + s]
+    return None
 
 
 def named(d: dict[str, float], table: dict[str, str]) -> dict[str, float | None]:

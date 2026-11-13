@@ -81,6 +81,7 @@ def gap_pressure(run: Path, reqs: list[dict], l1_tokens: float, chunk: int) -> l
             continue
         stored = (b - a) * chunk  # l1_write counts chunks (one key per chunk at TP=1)
         out.append({"agent": r["agent"], "turn": r["turn"], "moved": r["moved"], "ttft_s": r["ttft_s"],
+                    "prompt_tokens": r.get("prompt_tokens", 0), "cached_tokens": r.get("cached_tokens"),
                     "gap_s": round(r["t_submit_s"] - prev["t_end_s"], 1), "stored_tokens": stored,
                     "pressure": stored / l1_tokens})
     return out
@@ -119,13 +120,19 @@ def summarize(run: Path, ttft_target: float, recompute_ratio: float, kv_bytes_pe
     vb, va = run / "valkey_before.json", run / "valkey_after.json"
     valkey_evicted = (json.loads(va.read_text())["evicted_keys"] - json.loads(vb.read_text())["evicted_keys"]
                       if vb.exists() and va.exists() else None)
-    gaps = gap_pressure(run, reqs, l1_gb * 2**30 / kv_bytes_per_token if l1_gb else 0, chunk)
+    # L1 evicts above the watermark, so it holds about watermark x L1_SIZE_GB.
+    watermark = float(env.get("EVICTION_WATERMARK") or 0.8)
+    gaps = gap_pressure(run, reqs, watermark * l1_gb * 2**30 / kv_bytes_per_token if l1_gb else 0, chunk)
     by_bucket = {}
     for b in BUCKETS:
         rows = [g for g in gaps if bucket(g["pressure"]) == b]
         if rows:
+            # vLLM's cached_tokens counts tokens from its GPU cache and from LMCache
+            served = [g for g in rows if g["cached_tokens"] is not None and g["prompt_tokens"]]
             by_bucket[b] = {"requests": len(rows), "moved": sum(g["moved"] for g in rows),
-                            "ttft_p50": pct([g["ttft_s"] for g in rows], 50)}
+                            "ttft_p50": pct([g["ttft_s"] for g in rows], 50),
+                            "served_pct": (round(100 * sum(g["cached_tokens"] for g in served)
+                                                 / sum(g["prompt_tokens"] for g in served), 1) if served else None)}
     return {
         "run": run.name,
         "leg": env.get("CACHE_MODE", "?") + "+" + env.get("L2_BACKEND", "?"),
@@ -173,13 +180,13 @@ def main() -> None:
     gap_rows = [r for r in rows if r["idle_gap_pressure"]]
     if gap_rows:
         print("\nRequests after an idle gap, by what the agent's old worker stored in L1 during the gap / L1 size:")
-        print("| run | " + " | ".join(f"{b}: n, moved, TTFT p50" for b in BUCKETS) + " |")
+        print("| run | " + " | ".join(f"{b}: n, moved, % served, TTFT p50" for b in BUCKETS) + " |")
         print("|" + "---|" * (len(BUCKETS) + 1))
         for r in gap_rows:
             cells = []
             for b in BUCKETS:
                 v = r["idle_gap_pressure"].get(b)
-                cells.append(f"{v['requests']}, {v['moved']}, {fmt(v['ttft_p50'])}" if v else "-")
+                cells.append(f"{v['requests']}, {v['moved']}, {fmt(v['served_pct'])}, {fmt(v['ttft_p50'])}" if v else "-")
             print(f"| {r['run']} | " + " | ".join(cells) + " |")
     if any((r["valkey_evicted_keys"] or 0) > 0 for r in rows):
         print("\nWARN: Valkey evicted keys during some legs: its capacity, not L1, limited those runs.")

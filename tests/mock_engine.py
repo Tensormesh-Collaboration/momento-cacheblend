@@ -157,6 +157,9 @@ def build(args) -> tuple[FastAPI, FastAPI]:
             f'lmcache_mp_lookup_request_hit_tokens_total {s["hit_tok"]}',
             f'lmcache_mp_lookup_hit_l1_tokens_total {s["hit_l1"]}',
             f'lmcache_mp_lookup_hit_l2_tokens_total {s["hit_l2"]}',
+            # v0.5.8rc1 also exports the tier hits in keys (chunks): must not be added to tokens
+            f'lmcache_mp_lookup_hit_l1_keys_total {s["hit_l1"] // 256}',
+            f'lmcache_mp_lookup_hit_l2_keys_total {s["hit_l2"] // 256}',
             f'lmcache_blend_lookup_prefix_hit_tokens_total {s["prefix_hit"]}',
             f'lmcache_blend_lookup_non_prefix_hit_tokens_total {s["non_prefix_hit"]}',
         ]

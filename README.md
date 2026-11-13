@@ -62,7 +62,10 @@ Sweeps (design decisions 7, 9, 10):
 - **L1 per worker** is the one capacity axis: `--l1-gb 8,16,32`. Keep it below
   the working set so C and D spill to Valkey; A and B evict and recompute. The
   `L2 peak` column is the Valkey capacity the run needed: provision more than
-  that, so Valkey never becomes the limit.
+  that, so Valkey never becomes the limit. On GPUs, LMCache evicts only above
+  `EVICTION_WATERMARK` (0.8), so L1 holds about watermark x `L1_SIZE_GB`:
+  simulate that size. And what is free below the watermark must hold the
+  largest prompt, or those requests store nothing (`validate_config` checks).
 - **Idle-gap eviction pressure**: requests right after an idle gap are grouped
   by how much the agent's old worker stored into L1 while it waited (as a
   fraction of L1), with the share of their tokens still served from cache.
@@ -170,7 +173,10 @@ What changed from v0.5.6rc4 in how the kit launches workers:
   instead of `--enforce-eager` (`CB_DECODE_CUDAGRAPH=0` goes back), and the
   prefix legs match them when `FLAG_MATCHED=1`.
 - vLLM's GPU prefix cache is on in every leg (`ENABLE_APC=1`): the plugin now
-  coexists with it. Validated byte-identical on dense models only.
+  coexists with it. Validated byte-identical on dense models only. On an H200
+  it holds 680K tokens of Qwen3-Coder-30B KV, more than L1, and then serves
+  nearly every repeat itself (LMCache hits ~0 in a first run): set
+  `ENABLE_APC=0` in every leg to measure LMCache.
 - The plugin selects the CUSTOM attention backend, block size 64, and turns off
   vLLM's extensible KV cache by itself; the kit passes none of them.
 - With RDMA each worker's LMCache server starts with `--no-l1-use-lazy`, and

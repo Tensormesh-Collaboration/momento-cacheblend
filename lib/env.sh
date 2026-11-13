@@ -269,6 +269,21 @@ validate_config() {
   # sweep (scripts/chunk_smoke.sh). The plugin's block size is 64, and the chunk
   # must be a whole number of blocks.
   case "${CHUNK_SIZE:-}" in 64|128|256) ;; *) errs+=("CHUNK_SIZE='${CHUNK_SIZE:-}' must be 64, 128 or 256") ;; esac
+  # L1 evicts only above the watermark, and a request's chunks are allocated
+  # together: what is free below the watermark must hold the largest prompt.
+  if [[ "${HF_REPO:-}" == *Qwen3-Coder-30B* ]] && [[ "${L1_SIZE_GB:-}" =~ ^[0-9.]+$ ]]; then
+    local maxreq=${MAX_REQUEST_TOKENS:-${MAX_MODEL_LEN:-0}}
+    local msg
+    msg=$(awk -v l1="${L1_SIZE_GB}" -v w="${EVICTION_WATERMARK:-0.8}" -v t="${maxreq}" 'BEGIN {
+      if (w <= 0 || w > 1) { print "EVICTION_WATERMARK=" w " must be in (0, 1]"; exit }
+      free = (1 - w) * l1; need = t * 98304 / 2^30
+      if (free >= need) exit
+      fix = sprintf("raise L1_SIZE_GB to %.0f", need / (1 - w) + 0.5)
+      if (need < l1) fix = fix sprintf(", lower EVICTION_WATERMARK to %.2f", int((1 - need / l1) * 100) / 100)
+      printf "L1_SIZE_GB=%s at EVICTION_WATERMARK=%s leaves %.1f GiB free below the watermark, less than one %d-token prompt (%.1f GiB): such requests store and load nothing. Fix: %s, or set MAX_REQUEST_TOKENS to the largest prompt in the schedule", l1, w, free, t, need, fix
+    }')
+    [ -n "$msg" ] && errs+=("$msg")
+  fi
   if [ ${#errs[@]} -gt 0 ]; then
     echo "FATAL: invalid settings in cacheblend.env / profiles / cacheblend.env.local:" >&2
     printf '  - %s\n' "${errs[@]}" >&2

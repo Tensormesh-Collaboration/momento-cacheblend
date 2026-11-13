@@ -311,3 +311,15 @@ def test_replay_timeseries_feeds_gap_pressure(data_dir, tmp_path, mock_engines):
     assert row["valkey_evicted_keys"] == 0 and row["leg"] == "blend+valkey"
     assert row["idle_gaps"] and all(g["stored_tokens"] >= 0 for g in row["idle_gaps"])
     assert sum(v["requests"] for v in row["idle_gap_pressure"].values()) == len(row["idle_gaps"])
+
+
+def test_metrics_counter_does_not_mix_units():
+    """Series names as v0.5.8rc1 exports them (scraped from a live worker on dev-2)."""
+    from swarm import metrics
+    d = {"lmcache_mp_lookup_hit_l1_tokens_total": 18432.0, "lmcache_mp_lookup_hit_l1_keys_total": 72.0,
+         "lmcache_mp_l1_write_chunks_total": 72.0, "lmcache_mp_lookup_request_hit_tokens_total": 18640.0}
+    m = metrics.named(d, metrics.LMCACHE)
+    assert m["hit_l1"] == 18432.0
+    assert m["l1_write"] == 72.0
+    assert m["request_hit"] == 18640.0
+    assert m["hit_l2"] is None

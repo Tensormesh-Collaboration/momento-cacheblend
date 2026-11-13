@@ -43,11 +43,13 @@ echo "  mode ${CACHE_MODE}$([ "${CACHE_MODE}" = offload ] && echo " (flag-matche
     fs) echo " (${L2_HOST_PATH})" ;;
   esac)$([ -n "${COORDINATOR_URL:-}" ] && echo "   coordinator ${COORDINATOR_URL}")"
 
-mkdir -p "${WLOG}"
+# The v0.5.8rc1 engine image runs as uid 1000 (lmcache), not root: directories
+# it writes into must be writable by that user, whoever owns them on the host.
+mkdir -p "${WLOG}" && chmod a+rwx "${WLOG}"
 L2_MOUNT=()
 if [ "${L2_BACKEND}" = fs ]; then
   check_l2_netfs || exit 1
-  mkdir -p "${L2_HOST_PATH}"
+  mkdir -p "${L2_HOST_PATH}" && { chmod a+rwx "${L2_HOST_PATH}" 2>/dev/null || true; }
   L2_MOUNT=( -v "${L2_HOST_PATH}:${L2_CONTAINER_PATH}:rw" )
 fi
 
@@ -118,6 +120,8 @@ docker run -d --name "${NAME}" \
   -e L1_SIZE_GB="${L1_SIZE_GB}" \
   -e L1_INIT_SIZE_GB="${L1_INIT_SIZE_GB:-}" \
   -e L1_ALIGN_BYTES="${L1_ALIGN_BYTES}" \
+  -e EVICTION_WATERMARK="${EVICTION_WATERMARK:-0.8}" \
+  -e EVICTION_RATIO="${EVICTION_RATIO:-0.2}" \
   -e CACHE_MODE="${CACHE_MODE}" \
   -e FLAG_MATCHED="${FLAG_MATCHED}" \
   -e CB_DECODE_CUDAGRAPH="${CB_DECODE_CUDAGRAPH}" \
