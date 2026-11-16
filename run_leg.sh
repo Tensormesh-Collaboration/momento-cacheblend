@@ -43,8 +43,9 @@ source "${ROOT}/configs/${LEG}.env"
 set +a
 # shellcheck source=lib/env.sh
 source "${ROOT}/lib/env.sh"; load_env || exit 1
+need_pyenv "run_leg.sh (the replay client)" || exit 1
 SCHED=${SCHED:-$SCHEDULE}
-[ -f "${SCHED}/sessions.jsonl" ] || { echo "FATAL: no schedule at '${SCHED}' (python3 -m swarm.generate ... -o <dir>)" >&2; exit 1; }
+[ -f "${SCHED}/sessions.jsonl" ] || { echo "FATAL: no schedule at '${SCHED}' (python -m swarm.generate ... -o <dir>)" >&2; exit 1; }
 if [ "$LEG" = D ] && [ -z "${COORDINATOR_URL:-}" ] && [ "${WORKERS}" -gt 1 ]; then
   echo "NOTE: D without COORDINATOR_URL: each worker blends only chunks it stored itself (no cross-worker blending)."
 fi
@@ -56,7 +57,7 @@ echo "=== leg ${LEG}: ${CACHE_MODE} + L2 ${L2_BACKEND}, ${WORKERS} worker(s), sc
 "${KIT_DIR}/stop.sh" >/dev/null
 # Clean caches: Valkey keys under our prefix go whatever this leg's L2 is, so
 # a C or D leg never starts warm from an earlier leg.
-python3 "${KIT_DIR}/scripts/valkey.py" wipe 2>/dev/null || true
+"${PY}" "${KIT_DIR}/scripts/valkey.py" wipe 2>/dev/null || true
 [ "${L2_BACKEND}" = fs ] && wipe_l2
 "${KIT_DIR}/start.sh"
 
@@ -74,20 +75,20 @@ done > "${OUT}/config.env"
 # Valkey's own counters around the replay: its evicted_keys must not grow, or
 # Valkey's capacity, not L1, limited the leg (design decision 7).
 if [ "${L2_BACKEND}" = valkey ]; then
-  python3 "${KIT_DIR}/scripts/valkey.py" stats > "${OUT}/valkey_before.json" || rm -f "${OUT}/valkey_before.json"
+  "${PY}" "${KIT_DIR}/scripts/valkey.py" stats > "${OUT}/valkey_before.json" || rm -f "${OUT}/valkey_before.json"
 fi
 rc=0
-( cd "${KIT_DIR}" && python3 -m swarm.replay "${SCHED}" --engines "${ENGINES}" --lmcache-metrics "${METRICS}" \
+( cd "${KIT_DIR}" && "${PY}" -m swarm.replay "${SCHED}" --engines "${ENGINES}" --lmcache-metrics "${METRICS}" \
     --time-scale "${TIME_SCALE}" --idle-scale "${IDLE_SCALE}" -o "${OUT}" ) || rc=$?
 
 if [ "${L2_BACKEND}" = valkey ]; then
-  python3 "${KIT_DIR}/scripts/valkey.py" stats > "${OUT}/valkey_after.json" || rm -f "${OUT}/valkey_after.json"
+  "${PY}" "${KIT_DIR}/scripts/valkey.py" stats > "${OUT}/valkey_after.json" || rm -f "${OUT}/valkey_after.json"
 fi
 for w in $(worker_ids); do
   mkdir -p "${OUT}/w${w}"
   cp "$(worker_log_dir "$w")"/*.log "${OUT}/w${w}/" 2>/dev/null || true
 done
 [ "$KEEP" = 1 ] || "${KIT_DIR}/stop.sh" >/dev/null
-( cd "${KIT_DIR}" && python3 -m swarm.summarize "${OUT}" --ttft-target "${TTFT_TARGET}" ) || true
+( cd "${KIT_DIR}" && "${PY}" -m swarm.summarize "${OUT}" --ttft-target "${TTFT_TARGET}" ) || true
 echo "=== leg ${LEG} done (replay exit ${rc}): ${OUT}"
 exit "$rc"

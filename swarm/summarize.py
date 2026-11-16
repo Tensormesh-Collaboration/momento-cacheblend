@@ -2,7 +2,7 @@
 
     python -m swarm.summarize runs/A runs/B runs/C runs/D --ttft-target 2.0
 
-Token accounting (decision 4 in the design doc):
+Token accounting (docs/design.md, "Measurement"):
 
 * reused tokens = CacheBlend's prefix + non-prefix hit tokens when the blend
   counters are present, else LMCache's request-level hit

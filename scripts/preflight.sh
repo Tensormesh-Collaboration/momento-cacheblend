@@ -88,11 +88,11 @@ fi
 
 if [ "${L2_BACKEND}" = valkey ]; then
 echo "== 6. Valkey L2 =="
-python3 "${KIT_DIR}/scripts/valkey.py" ping || fail "Valkey at ${VALKEY_NODES} does not answer (VALKEY_NODES, VALKEY_PASSWORD, VALKEY_TLS)"
-python3 "${KIT_DIR}/scripts/valkey.py" info || true
+"${PY}" "${KIT_DIR}/scripts/valkey.py" ping || fail "Valkey at ${VALKEY_NODES} does not answer (VALKEY_NODES, VALKEY_PASSWORD, VALKEY_TLS)"
+"${PY}" "${KIT_DIR}/scripts/valkey.py" info || true
 ok "Valkey reachable; this kit's keys live under ${VALKEY_KEY_PREFIX}@"
 if [ "${VALKEY_TRANSPORT}" != tcp ]; then
-  python3 "${KIT_DIR}/scripts/valkey.py" blob \
+  "${PY}" "${KIT_DIR}/scripts/valkey.py" blob \
     || fail "VALKEY_TRANSPORT=${VALKEY_TRANSPORT} needs the valkey-large-object module on every Valkey node (BLOB.INFO failed)"
   ok "valkey-large-object module answers BLOB.INFO"
 fi
@@ -113,7 +113,7 @@ if [ "${VALKEY_TRANSPORT}" = rdma ] && [ "${VALKEY_RDMA_PROVIDER}" != tcp ]; the
   if command -v ibv_devinfo >/dev/null 2>&1; then
     MR=$(ibv_devinfo -v 2>/dev/null | awk '/max_mr_size/{print $2; exit}')
     if [ -n "$MR" ]; then
-      MR_GB=$(python3 -c 'import sys; print(int(sys.argv[1], 0) // 2**30)' "$MR")   # ibv_devinfo prints hex
+      MR_GB=$("${PY}" -c 'import sys; print(int(sys.argv[1], 0) // 2**30)' "$MR")   # ibv_devinfo prints hex
       echo "     EFA max_mr_size: ${MR_GB} GiB (EFA_MAX_MR_GB=${EFA_MAX_MR_GB})"
       [ $(( VALKEY_WORKERS * L1_SIZE_GB )) -le "$MR_GB" ] \
         || fail "VALKEY_WORKERS=${VALKEY_WORKERS} x L1_SIZE_GB=${L1_SIZE_GB} GiB exceeds this card's max_mr_size (${MR_GB} GiB)"

@@ -165,7 +165,7 @@ def test_simulator_lru_eviction():
     docs = ["".join(rng.choice("uvwxyz") for _ in range(4 * CHUNK)) for _ in range(3)]
     ags = [_agent(f"a{i}", 0, [docs[i], "again"], start=i) for i in range(3)]
     p = simulate.Prompts(Tokenizer("chars"), ags)
-    small = simulate.run(p, "A", 1, 4, 0, False, 1e9, 1e9)
+    small = simulate.run(p, "A", 1, 4, 0, False, 1e9, 1e9, watermark=None)  # ideal LRU
     big = simulate.run(p, "A", 1, 0, 0, False, 1e9, 1e9)
     assert small["l1_evicted_chunks"] > 0
     assert small["totals"]["prefix_l1"] < big["totals"]["prefix_l1"]
@@ -286,7 +286,7 @@ def test_simulator_idle_gap_pressure_and_l2_peak():
     paused.turns[0].idle_s = 100.0
     busy = [_agent(f"b{i}", 1, [docs[i + 1], "more"], start=10.0 + i) for i in range(3)]
     p = simulate.Prompts(Tokenizer("chars"), [paused] + busy)
-    small = simulate.run(p, "A", 1, 8, 0, False, 1e9, 1e9)   # L1 of 8 chunks: the busy agents evict it
+    small = simulate.run(p, "A", 1, 8, 0, False, 1e9, 1e9, watermark=None)   # ideal LRU of 8 chunks: the busy agents evict it
     big = simulate.run(p, "C", 1, 0, 0, False, 1e9, 1e9)
     assert set(small["idle_gap_pressure"]) == {">=1"}
     g = small["idle_gaps"][0]
@@ -323,3 +323,30 @@ def test_metrics_counter_does_not_mix_units():
     assert m["l1_write"] == 72.0
     assert m["request_hit"] == 18640.0
     assert m["hit_l2"] is None
+
+
+def test_simulator_lmcache_l1_all_or_nothing_and_watermark():
+    """L1 as LMCache runs it: a prompt that does not fit in free space stores nothing;
+    eviction happens only above the watermark, once per simulated second."""
+    rng = random.Random(9)
+    docs = ["".join(rng.choice("qrstuv") for _ in range(6 * CHUNK)) for _ in range(4)]
+    # ~7-chunk prompts. 20-chunk L1 evicting at 50%: 10 chunks stay free, enough for one prompt
+    ags = [_agent(f"a{i}", 0, [docs[i], "again"], start=10.0 * i) for i in range(4)]
+    for ag in ags:
+        ag.turns[0].after_s = 2.0
+    p = simulate.Prompts(Tokenizer("chars"), ags)
+    ok = simulate.run(p, "A", 1, 20, 0, False, 1e9, 1e9, watermark=0.5, ratio=0.5)
+    assert ok["failed_stores"] == 0 and ok["l1_evicted_chunks"] > 0
+    assert ok["totals"]["prefix_l1"] > 0           # each agent's repeat 2 s later hits
+    # 10-chunk L1 at a 0.9 watermark: after one 7-chunk prompt L1 never reaches 90%,
+    # so it never evicts, and the next prompt does not fit in the 3 chunks left
+    stuck = simulate.run(p, "A", 1, 10, 0, False, 1e9, 1e9, watermark=0.9, ratio=0.5)
+    assert stuck["failed_stores"] >= 3 and stuck["l1_evicted_chunks"] == 0
+    l1 = simulate.LMCacheL1(10, 0.5, 0.5)
+    for k in range(8):
+        l1.touch(k)
+    l1.tick(0.0)
+    l1.tick(0.5)                                     # same second: no eviction round yet
+    assert len(l1.d) == 8
+    l1.tick(1.0)                                     # one round: evict half of the 8
+    assert len(l1.d) == 4 and 0 not in l1 and 7 in l1

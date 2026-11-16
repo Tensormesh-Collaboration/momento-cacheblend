@@ -210,7 +210,7 @@ else
 fi
 
 # --- 2. vLLM ------------------------------------------------------------------------
-# blend:   what cacheblend-plugin v0.5.8rc1 requires (docs/design.md §7):
+# blend:   what cacheblend-plugin v0.5.8rc1 requires (docs/design.md "Engine flags"):
 #          --no-enable-chunked-prefill (asserted), one whole prompt per step
 #          (--max-num-batched-tokens = MAX_MODEL_LEN), and decode-only CUDA
 #          graphs (FULL_DECODE_ONLY, mode 0) or --enforce-eager. The plugin
@@ -242,7 +242,7 @@ if [ "${CB_DECODE_CUDAGRAPH:-1}" = 1 ]; then
 else
   GRAPH_ARGS=( --enforce-eager )
 fi
-APC_ARGS=( --enable-prefix-caching ); [ "${ENABLE_APC:-1}" = 1 ] || APC_ARGS=( --no-enable-prefix-caching )
+APC_ARGS=( --enable-prefix-caching ); [ "${ENABLE_APC:-0}" = 1 ] || APC_ARGS=( --no-enable-prefix-caching )
 if [ "${CACHE_MODE:-blend}" = blend ] || [ "${FLAG_MATCHED:-1}" = 1 ]; then
   MODE_ARGS=( --max-num-seqs "${MAX_NUM_SEQS}"
               --max-num-batched-tokens "${MAX_MODEL_LEN}"

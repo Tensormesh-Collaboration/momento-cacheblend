@@ -41,13 +41,13 @@ if [ "${CACHE_MODE}" = blend ]; then
   chk "blend module loaded (/status has active_cb_lookups)" \
       "curl -sf http://127.0.0.1:${HTTP}/status | grep -q active_cb_lookups"
   chk "CacheBlend reuses a shifted body (non-prefix hits > 0)" \
-      "python3 '${KIT_DIR}/scripts/smoke_cb.py' --port ${PORT} --metrics http://127.0.0.1:${HTTP}/metrics --chunk ${CHUNK_SIZE}"
+      "\"${PY}\" '${KIT_DIR}/scripts/smoke_cb.py' --port ${PORT} --metrics http://127.0.0.1:${HTTP}/metrics --chunk ${CHUNK_SIZE}"
   grep -h 'CB: auto-selected\|CB: preferring kv cache block size\|CB: turned off' "$L/vllm.log" 2>/dev/null | tail -3 || true
 fi
 
 count_l2() {
   case "${L2_BACKEND}" in
-    valkey) python3 "${KIT_DIR}/scripts/valkey.py" count 2>/dev/null || echo 0 ;;
+    valkey) "${PY}" "${KIT_DIR}/scripts/valkey.py" count 2>/dev/null || echo 0 ;;
     fs) find "${L2_HOST_PATH}" -type f 2>/dev/null | wc -l ;;
   esac
 }
@@ -55,7 +55,7 @@ count_l2() {
 if [ "${L2_BACKEND}" != none ]; then
   echo "== D. L2 (${L2_BACKEND}) =="
   before=$(count_l2)
-  VLLM_PORT=$PORT python3 - <<'PY'
+  VLLM_PORT=$PORT "${PY}" - <<'PY'
 import json, os, urllib.request
 port = os.environ["VLLM_PORT"]
 body = json.dumps({

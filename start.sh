@@ -28,7 +28,7 @@ if [ "${CACHE_MODE}" = blend ] && [ ! -d "${PLUGIN_HOST_DIR}/lmcache_cacheblend"
   echo "FATAL: plugin not staged. Run ./setup.sh first." >&2; exit 1
 fi
 if [ "${L2_BACKEND}" = valkey ]; then
-  python3 "${KIT_DIR}/scripts/valkey.py" ping >/dev/null \
+  "${PY}" "${KIT_DIR}/scripts/valkey.py" ping >/dev/null \
     || { echo "FATAL: Valkey at ${VALKEY_NODES} does not answer PING (scripts/valkey.py ping)" >&2; exit 1; }
 fi
 

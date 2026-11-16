@@ -29,7 +29,7 @@ exec 9>"${KIT_DIR}/.setup.lock"
 if command -v flock >/dev/null 2>&1; then   # util-linux; absent on macOS
   flock -n 9 || { echo "FATAL: another ./setup.sh is already running (check your other tmux windows)." >&2; exit 1; }
 fi
-step() { echo; echo "=== [$1/5] $2 ==="; }
+step() { echo; echo "=== [$1/6] $2 ==="; }
 die()  { echo "FATAL: $*" >&2; exit 1; }
 
 # Ask once, remember in the gitignored .local file, never echo the value.
@@ -46,7 +46,16 @@ remember_secret() {  # remember_secret <VAR> <prompt>
 }
 
 # ---------------------------------------------------------------------------
-step 1 "Registry access (${REGISTRY})"
+step 1 "Host Python environment (.venv, for the replay client and swarm tools)"
+if "${KIT_DIR}/.venv/bin/python" -c 'import numpy, pyarrow, openai, transformers' >/dev/null 2>&1; then
+  echo "  ${KIT_DIR}/.venv ok ($("${KIT_DIR}/.venv/bin/python" --version))"
+else
+  "${KIT_DIR}/scripts/pyenv.sh"
+fi
+PY="${KIT_DIR}/.venv/bin/python"   # lib/env.sh picked python3 before .venv existed
+
+# ---------------------------------------------------------------------------
+step 2 "Registry access (${REGISTRY})"
 [ -n "${TM_API_KEY:-}" ] || remember_secret TM_API_KEY "Tensormesh API key, starts with tm_ (TM_API_KEY)"
 case "${TM_API_KEY}" in tm_*) ;; *) die "TM_API_KEY does not start with tm_. Replace it:  sed -i '/^TM_API_KEY=/d' ${LOCAL_ENV} && ./setup.sh" ;; esac
 registry_login || die "${REGISTRY} rejected TM_API_KEY (reason above). Keys expire and can be revoked:
@@ -60,7 +69,7 @@ docker manifest inspect "${PLUGIN_IMAGE}" >/dev/null 2>&1 \
 echo "  ${PLUGIN_IMAGE} available"
 
 # ---------------------------------------------------------------------------
-step 2 "Driver, storage, engine image"
+step 3 "Driver, storage, engine image"
 # Checked here as well as in preflight so a too-old driver fails BEFORE a
 # 110 GB download, not after it.
 echo "  querying driver (nvidia-smi) ..."
@@ -94,7 +103,7 @@ echo "  data dir ${DATA_DIR}: ${FREE_GB}G free, need ~${NEED_GB}G (${L2_NOTE}$([
 docker pull -q "${ENGINE_IMAGE}" >/dev/null && echo "  ${ENGINE_IMAGE} ok"
 
 # ---------------------------------------------------------------------------
-step 3 "Model weights"
+step 4 "Model weights"
 if [ -z "${MODEL_HOST_DIR:-}" ]; then
   echo "  MODEL_HOST_DIR is empty: vLLM pulls ${MODEL} from the Hub at start. Skipping."
 elif [ -f "${MODEL_HOST_DIR}/.download-complete" ] || model_complete "${MODEL_HOST_DIR}"; then
@@ -161,7 +170,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step 4 "Preflight (8 gates)"
+step 5 "Preflight (8 gates)"
 if [ -n "$(docker ps -q -f 'name=^momento-w[0-9]+$')" ]; then
   echo "  SKIPPED: worker containers are running and hold the GPUs."
   echo "  To re-check: ./stop.sh && ./setup.sh"
@@ -170,7 +179,7 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-step 5 "CacheBlend plugin"
+step 6 "CacheBlend plugin"
 if [ "$(cat "${PLUGIN_HOST_DIR}/.staged-from" 2>/dev/null)" = "${PLUGIN_IMAGE}" ]; then
   echo "  already staged from ${PLUGIN_IMAGE}"
 else

@@ -18,6 +18,16 @@
 
 # Repository root: this file lives in <root>/lib/.
 KIT_DIR=${KIT_DIR:-$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)}
+# Host-side Python: the kit's .venv (scripts/pyenv.sh) when it exists, else the
+# system python3, which is enough for the stdlib-only helpers (valkey.py, ...).
+PY="${KIT_DIR}/.venv/bin/python"
+[ -x "${PY}" ] || PY=$(command -v python3 || echo python3)
+# need_pyenv <what> — fail early when a step needs the packages in requirements.txt
+need_pyenv() {
+  "${PY}" -c 'import openai, numpy' >/dev/null 2>&1 && return 0
+  echo "FATAL: $1 needs the kit's Python environment. Create it once with: ${KIT_DIR}/scripts/pyenv.sh" >&2
+  return 1
+}
 
 load_env() {
   [ -n "${CACHEBLEND_ENV_LOADED:-}" ] && return 0
@@ -209,7 +219,7 @@ model_complete() {
   local d=$1
   [ -f "$d/config.json" ] || return 1
   if [ -f "$d/model.safetensors.index.json" ]; then
-    python3 -c 'import json,os,sys; d=sys.argv[1]; s=set(json.load(open(os.path.join(d,"model.safetensors.index.json")))["weight_map"].values()); sys.exit(0 if all(os.path.isfile(os.path.join(d,f)) for f in s) else 1)' "$d" 2>/dev/null
+    "${PY}" -c 'import json,os,sys; d=sys.argv[1]; s=set(json.load(open(os.path.join(d,"model.safetensors.index.json")))["weight_map"].values()); sys.exit(0 if all(os.path.isfile(os.path.join(d,f)) for f in s) else 1)' "$d" 2>/dev/null
   else
     compgen -G "$d/*.safetensors" >/dev/null
   fi

@@ -29,7 +29,7 @@ done
 
 [ "$WIPE" = 1 ] || { echo "L2 kept (--wipe-l2 to delete it)"; exit 0; }
 case "${L2_BACKEND}" in
-  valkey) python3 "${KIT_DIR}/scripts/valkey.py" wipe ;;
+  valkey) "${PY}" "${KIT_DIR}/scripts/valkey.py" wipe ;;
   fs) wipe_l2 && echo "fs L2 cleared at ${L2_HOST_PATH}" ;;
   none) echo "no L2 configured" ;;
 esac

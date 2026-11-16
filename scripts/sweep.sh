@@ -3,10 +3,10 @@
 # scripts/sweep.sh — run legs over a grid and summarize them in one table.
 #
 #   scripts/sweep.sh --schedules "schedules/sub-q0 schedules/sub-q0.5 schedules/sub-q1" \
-#                    --legs "C D" --l1 "22" [--chunks "256"] [--name moves]
+#                    --legs "A C" --l1 "16 128" [--chunks "256"] [--name moves]
 #
 #   --schedules  schedule directories; a worker-move sweep is the -q<p> outputs of
-#                `python3 -m swarm.generate ... --move-prob 0,0.5,1` (identical
+#                `python -m swarm.generate ... --move-prob 0,0.5,1` (identical
 #                schedules except for which agents move after idle gaps)
 #   --legs       any of A B C D (default: all four)
 #   --l1         L1 per worker, GiB (design decision 7: the one capacity axis;
@@ -17,11 +17,12 @@
 #
 # Each cell is one ./run_leg.sh from empty caches. Results go to
 # runs/<timestamp>-sweep-<name>/<schedule>__<leg>__l1<G>__c<C>/ plus summary.md
-# and summary.json (python3 -m swarm.summarize over every cell).
+# and summary.json (python -m swarm.summarize over every cell).
 # ---------------------------------------------------------------------------
 set -Eeuo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+PY="${ROOT}/.venv/bin/python"; [ -x "${PY}" ] || PY=python3
 SCHEDS=""; LEGS="A B C D"; L1S=""; CHUNKS="256"; NAME="grid"; TTFT=""
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -60,7 +61,7 @@ for sched in $SCHEDS; do
 done
 
 if [ ${#cells[@]} -gt 0 ]; then
-  ( cd "$ROOT" && python3 -m swarm.summarize "${cells[@]}" ${TTFT:+--ttft-target "$TTFT"} -o "${OUT}/summary.json" ) | tee "${OUT}/summary.md"
+  ( cd "$ROOT" && "${PY}" -m swarm.summarize "${cells[@]}" ${TTFT:+--ttft-target "$TTFT"} -o "${OUT}/summary.json" ) | tee "${OUT}/summary.md"
 fi
 [ ${#failed[@]} -eq 0 ] || { printf 'FAILED cells:\n'; printf '  %s\n' "${failed[@]}"; exit 1; }
 echo "sweep done: ${OUT}"

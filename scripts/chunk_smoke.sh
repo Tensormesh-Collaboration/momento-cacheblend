@@ -48,7 +48,7 @@ for chunk in $CHUNKS; do
       # shellcheck source=../lib/env.sh
       source "${ROOT}/lib/env.sh"; load_env || exit 1
       "${KIT_DIR}/stop.sh" >/dev/null
-      python3 "${KIT_DIR}/scripts/valkey.py" wipe >/dev/null 2>&1 || true
+      "${PY}" "${KIT_DIR}/scripts/valkey.py" wipe >/dev/null 2>&1 || true
       "${KIT_DIR}/start.sh"
     ) > "${dir}/start-verify.log" 2>&1 || rc=$?
     cp "${ROOT}"/logs/w0/*.log "$dir/" 2>/dev/null || true

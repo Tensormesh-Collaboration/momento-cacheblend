@@ -1,6 +1,6 @@
 """Offline preview of the four configurations on a schedule, before any GPU time.
 
-    python -m swarm.simulate schedules/moto-4x5 --l1-gb 8,32 --l2-gb 0
+    python -m swarm.simulate schedules/moto-8x5-sub --l1-gb 16,32 --eviction-watermark 0.5
 
 Replays the schedule through LMCache's chunking rules and reports, per
 configuration, where each input token would have come from:
@@ -76,6 +76,53 @@ class LRU:
         self.peak = max(self.peak, len(self.d))
 
 
+class LMCacheL1(LRU):
+    """L1 as LMCache's MP server runs it (v0.5.8rc1), not an ideal LRU.
+
+    * Eviction is a background loop: once a second, if usage is above the
+      watermark, it evicts `ratio` of the resident chunks, least recently used
+      first. So L1 sits between about watermark x (1 - ratio) and watermark full.
+    * A request's chunks are allocated in one batch, for a prefetch from L2 and
+      for a store: if the batch does not fit in what is free, none of it is
+      allocated (the prefetch is dropped and recomputed; nothing is stored, in
+      L1 or L2), and nothing is evicted to make room.
+    """
+
+    def __init__(self, capacity: int, watermark: float, ratio: float):
+        super().__init__(capacity)
+        self.watermark, self.ratio = watermark, ratio
+        self.last_tick = None
+        self.failed_stores = self.failed_prefetches = 0
+
+    def tick(self, now: float) -> None:
+        if not self.cap:
+            return
+        if self.last_tick is None:
+            self.last_tick = now
+        rounds = int(now) - int(self.last_tick)
+        self.last_tick = now
+        for _ in range(max(0, rounds)):
+            if len(self.d) <= self.watermark * self.cap:
+                break
+            for _ in range(max(1, int(self.ratio * len(self.d)))):
+                self.d.popitem(last=False)
+                self.evicted += 1
+
+    def free(self) -> int:
+        return self.cap - len(self.d) if self.cap else 1 << 62
+
+    def touch(self, k: int) -> None:
+        if k in self.d:
+            self.d.move_to_end(k)
+            return
+        self.d[k] = None  # allocation was checked by the caller (fits())
+        self.inserted += 1
+        self.peak = max(self.peak, len(self.d))
+
+    def fits(self, n: int) -> bool:
+        return n <= self.free()
+
+
 @dataclass
 class Prompts:
     """Per-request token arrays, built from per-message tokens."""
@@ -98,10 +145,13 @@ class Prompts:
 
 
 def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: int,
-        fleet_blend: bool, prefill_tps: float, decode_tps: float, chunk: int = CHUNK) -> dict:
+        fleet_blend: bool, prefill_tps: float, decode_tps: float, chunk: int = CHUNK,
+        watermark: float | None = 0.8, ratio: float = 0.2) -> dict:
+    """watermark=None: an ideal LRU of l1_chunks; else LMCache's eviction (LMCacheL1)."""
     mode, valkey = CONFIGS[config]
     agents = prompts.agents
-    l1 = [LRU(l1_chunks) for _ in range(workers)]
+    lmc = watermark is not None
+    l1 = [LMCacheL1(l1_chunks, watermark, ratio) if lmc else LRU(l1_chunks) for _ in range(workers)]
     l2 = LRU(l2_chunks) if valkey else None
     local_index: list[dict[int, set[int]]] = [defaultdict(set) for _ in range(workers)]
     fleet_index: dict[int, set[int]] = defaultdict(set)
@@ -123,6 +173,9 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
         ag = agents[ai]
         turn = ag.turns[k]
         w = turn.worker % workers
+        if lmc:
+            for x in l1:
+                x.tick(now)
         T = prompts.tokens(ai, k)
         L = len(T)
         contents = aligned_chunk_hashes(T, chunk)
@@ -183,6 +236,15 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
                 i += 1
             if run_end > run_start >= 0:
                 runs.append(run_end - run_start)
+        # --- prefetch from L2 into L1: one batch, all or nothing -------------------
+        if lmc and (p2 or b2):
+            need = len({kk for kk in hit_keys if kk not in l1[w]})
+            if not l1[w].fits(need):
+                l1[w].failed_prefetches += 1
+                hit_keys = keys[:p1] + [kk for kk in hit_keys[p1 + p2:] if kk in l1[w]]
+                p2, b2 = 0, 0
+                b1 = len(hit_keys) - p1
+                pre = p1 * chunk
         # --- accounting -------------------------------------------------------
         r = {"prefix_l1": p1 * chunk, "prefix_l2": p2 * chunk, "blend_l1": b1 * chunk, "blend_l2": b2 * chunk,
              "blend_chunks_loaded": b1 + b2}
@@ -198,7 +260,8 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
         per_agent_skip[ai] += L - r["new"]
         if k and ag.turns[k - 1].idle_s and ai in last_seen:
             w0, ins0, ev0 = last_seen[ai]
-            cap_tokens = l1[w0].cap * chunk
+            # LMCache's L1 evicts above the watermark: it holds about watermark x its size
+            cap_tokens = l1[w0].cap * chunk * (watermark if lmc else 1.0)
             stored = (l1[w0].inserted - ins0) * chunk
             gaps.append({"gap_s": ag.turns[k - 1].idle_s, "moved": turn.moved,
                          "stored_tokens": stored, "evicted_chunks": l1[w0].evicted - ev0,
@@ -207,7 +270,12 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
         # --- store --------------------------------------------------------------
         for key in hit_keys:
             l1[w].touch(key)
-        for key, h in zip(keys, contents):
+        if lmc and not l1[w].fits(len({kk for kk in keys if kk not in l1[w]})):
+            l1[w].failed_stores += 1  # one batch: nothing stored, in L1 or L2
+            keys_to_store = []
+        else:
+            keys_to_store = keys
+        for key, h in zip(keys_to_store, contents):
             l1[w].touch(key)
             if l2 is not None:
                 l2.touch(key)
@@ -231,6 +299,8 @@ def run(prompts: Prompts, config: str, workers: int, l1_chunks: int, l2_chunks: 
         c["served"] += g["served"]
     return {"config": config, "chunk": chunk, "totals": dict(tot), "by_kind": {k: dict(v) for k, v in by_kind.items()},
             "l1_evicted_chunks": sum(x.evicted for x in l1), "l2_evicted_chunks": l2.evicted if l2 else 0,
+            "failed_stores": sum(getattr(x, "failed_stores", 0) for x in l1),
+            "failed_prefetches": sum(getattr(x, "failed_prefetches", 0) for x in l1),
             # The local matcher's table holds 2^20 chunks per server lifetime; past
             # that, new content can no longer be blended (LMCache blend_counters.py).
             "max_chunks_indexed_per_worker": max(len(x) for x in stored_keys),
@@ -265,7 +335,12 @@ def main() -> None:
     ap.add_argument("schedules", type=Path, nargs="+",
                     help="one or more schedule directories (e.g. the -q0/-q0.5/-q1 outputs of a move sweep)")
     ap.add_argument("--configs", default="ABCD")
-    ap.add_argument("--l1-gb", default="32", help="L1 per worker, GiB; comma-separated to sweep")
+    ap.add_argument("--l1-gb", default="32", help="L1 per worker (L1_SIZE_GB), GiB; comma-separated to sweep")
+    ap.add_argument("--eviction-watermark", type=float, default=0.8,
+                    help="EVICTION_WATERMARK: L1 evicts once fuller than this (LMCache's loop); match the leg's setting")
+    ap.add_argument("--eviction-ratio", type=float, default=0.2, help="EVICTION_RATIO: share of resident chunks each eviction frees")
+    ap.add_argument("--ideal-lru", action="store_true",
+                    help="model L1 as an ideal LRU of its full size instead of LMCache's eviction (the pre-GPU-run model)")
     ap.add_argument("--l2-gb", type=float, default=0, help="Valkey capacity, GiB (0 = unbounded)")
     ap.add_argument("--workers", type=int, default=0, help="0 = from the schedule")
     ap.add_argument("--kv-bytes-per-token", type=int, default=98304,
@@ -299,7 +374,7 @@ def simulate_one(a: argparse.Namespace, sched: Path, tokenizers: dict) -> list[d
           f"move probability {q}, {meta.get('idle_gaps', '?')} idle gaps, {meta.get('moves', '?')} moves, "
           f"KV {a.kv_bytes_per_token / 1024:.0f} KiB/token, tokenizer {tok.name}")
     print(f"{'chunk':>5} {'L1/wkr':>7} {'cfg':>3} {'pfx L1':>7} {'pfx L2':>7} {'blnd L1':>7} {'blnd L2':>7} "
-          f"{'new':>6} {'skipped':>8} {'blend<-others':>13} {'blend<256':>9} {'idx/wkr':>8} {'L2 peak':>8}")
+          f"{'new':>6} {'skipped':>8} {'blend<-others':>13} {'blend<256':>9} {'idx/wkr':>8} {'L2 peak':>8} {'no-store':>8}")
     for chunk in [int(x) for x in a.chunk_size.split(",")]:
         chunk_bytes = a.kv_bytes_per_token * chunk
         for l1_gb in [float(x) for x in a.l1_gb.split(",")]:
@@ -307,7 +382,8 @@ def simulate_one(a: argparse.Namespace, sched: Path, tokenizers: dict) -> list[d
             l2_chunks = int(a.l2_gb * 2**30 // chunk_bytes)
             for cfg in a.configs:
                 res = run(prompts, cfg, workers, l1_chunks, l2_chunks, a.fleet_blend and cfg == "D",
-                          a.prefill_tps, a.decode_tps, chunk)
+                          a.prefill_tps, a.decode_tps, chunk,
+                          None if a.ideal_lru else a.eviction_watermark, a.eviction_ratio)
                 res.update(schedule=str(sched), move_prob=q, l1_gb=l1_gb, l2_gb=a.l2_gb, chunk_bytes=chunk_bytes,
                            shares=shares(res["totals"], a.recompute_ratio),
                            shares_by_kind={k: shares(v, a.recompute_ratio) for k, v in res["by_kind"].items()})
@@ -317,11 +393,15 @@ def simulate_one(a: argparse.Namespace, sched: Path, tokenizers: dict) -> list[d
                 print(f"{chunk:>5} {l1_gb:>7g} {cfg:>3} {s['prefix_l1']:>7} {s['prefix_l2']:>7} {s['blend_l1']:>7} "
                       f"{s['blend_l2']:>7} {s['new']:>6} {s['skipped']:>8} {s['blend_other_agents']:>13} "
                       f"{short} {res['max_chunks_indexed_per_worker']:>8} "
-                      f"{peak:>8}")
+                      f"{peak:>8} {res['failed_stores'] + res['failed_prefetches']:>8}")
                 results.append(res)
     print("(% of input tokens; skipped = prefix + blend x (1 - recompute ratio); blend<256 = share of CacheBlend "
           "tokens in matches shorter than 256 tokens; idx/wkr = chunks a local matcher indexed, cap 2^20; "
-          "L2 peak = Valkey capacity this run needed, GiB)")
+          "L2 peak = Valkey capacity this run needed, GiB; no-store = requests whose chunks did not fit in L1's free "
+          "space, so nothing was stored or prefetched: raise L1 or lower the watermark until it is 0)")
+    model = ("ideal LRU" if a.ideal_lru else
+             f"LMCache eviction: watermark {a.eviction_watermark}, ratio {a.eviction_ratio}, all-or-nothing allocation")
+    print(f"(L1 model: {model})")
     gap_rows = [r for r in results if r["idle_gap_pressure"]]
     if gap_rows:
         print("\nRequests after an idle gap, by what the agent's old worker stored during the gap / its L1 size "

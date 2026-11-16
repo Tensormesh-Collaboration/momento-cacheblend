@@ -45,42 +45,57 @@ every leg sees identical prompts and the same decode load.
 
 ## Offline preview (Qwen3-Coder tokenizer, unbounded Valkey, 2 workers)
 
-`python3 -m swarm.simulate`, moto repo; % of input tokens. "Skipped" counts
-CacheBlend hits at 85% (15% recompute).
+`python -m swarm.simulate <schedule> --l1-gb <L1_SIZE_GB> --eviction-watermark <W>`,
+moto repo; % of input tokens skipped. "Skipped" counts CacheBlend hits at 85%
+(15% recompute). L1 is modelled the way LMCache runs it (see "L1 sizing" in
+[design.md](design.md)): it evicts once fuller than the watermark, so it caches
+about watermark x its size, and a prompt that does not fit in what is free is
+not stored at all. Every row below keeps the largest prompt of its schedule
+inside the free space (`no-store` = 0).
 
-| Schedule | L1 / worker | A | B | C | D |
+| Schedule | L1 per worker, watermark | A | B | C | D |
 |---|---|---|---|---|---|
-| 4 x 5, long sessions (678 requests) | 8 GiB | 79.4 | 86.0 | 96.4 | 97.1 |
-| 4 x 5, long sessions | 32 GiB | 93.7 | 95.2 | 96.4 | 97.1 |
-| 8 x 5, sub-agents, 6 turns, 4-file bundle (240 requests) | 8 GiB | 74.5 | 83.9 | 85.4 | 92.3 |
-| 8 x 5, sub-agents | 32 GiB | 81.4 | 88.9 | 85.4 | 92.3 |
-| 4 x 5, tool-result clearing over 24K, keep 3 | 8 GiB | 88.7 | 90.5 | 93.2 | 94.9 |
+| 4 x 5, long sessions (678 requests) | 16 GiB, 0.5 | 75.5 | 84.5 | 96.4 | 96.9 |
+| 4 x 5, long sessions | 32 GiB, 0.8 | 92.6 | 94.3 | 96.4 | 96.9 |
+| **8 x 5, sub-agents, 6 turns, 4-file bundle (240 requests)** | **16 GiB, 0.5** (the profile's default) | **74.6** | **82.3** | **85.4** | **90.9** |
+| 8 x 5, sub-agents | 30 GiB, 0.8 | 80.9 | 88.2 | 85.4 | 90.9 |
+| 4 x 5, tool-result clearing over 24K, keep 3 | 12 GiB, 0.5 | 85.7 | 87.7 | 93.2 | 94.6 |
 
-What it says, before any GPU time:
+What it says, before the measured runs:
 
-- In long sessions with room in L1, prefix caching already skips ~94%:
-  CacheBlend adds ~1.5 points, Valkey ~2.7.
+- In long sessions with room in L1, prefix caching already skips ~93%:
+  CacheBlend adds ~1.7 points, Valkey ~3.8.
 - Under L1 pressure Valkey recovers almost everything as prefix hits (C), and
-  CacheBlend adds little on top (D − C = 0.7). CacheBlend's gain is larger
-  without Valkey (B − A = 6.6), the opposite of the draft blog's Figure 4 claim.
-- With short-lived sub-agents both layers matter: each adds roughly 10 points
-  alone and D computes about a quarter of A's new tokens (6.5% against 25.5%).
+  CacheBlend adds little on top (D - C = 0.5). CacheBlend's gain is much larger
+  without Valkey (B - A = 9.0).
+- With short-lived sub-agents both layers matter: each adds 8-11 points alone,
+  and D computes about a third of A's new tokens (8.2% against 25.4%).
+- Valkey needs 59-77 GiB for these schedules (the simulator's `L2 peak`).
 
-The simulator has no queueing, no vLLM GPU prefix cache, and an idealized
-LRU; treat it as a way to pick the legs worth running, not as results.
+How far to trust it: on a first GPU run (one H200 worker, a 72-request 2 x 3
+schedule, L1 6 GiB at watermark 0.5, vLLM's GPU prefix cache off), the measured
+legs came within 3.5 points of the simulator:
+
+| | A | B | C | D |
+|---|---|---|---|---|
+| Measured, % of prompt tokens reused | 73.8 | 78.5 | 92.1 | 93.1 |
+| Simulator, same schedule and L1 | 70.3 | 78.6 | 92.1 | 93.0 |
+
+The simulator has no queueing and no timing effects on hit rates; use it to
+pick L1 sizes and legs, and the GPU runs for results.
 
 ## Chunk size: 256, 128, 64
 
-`python3 -m swarm.simulate <schedule> --chunk-size 256,128,64`. Same
+`python -m swarm.simulate <schedule> --chunk-size 256,128,64`. Same
 schedules and assumptions as above; the share of input tokens served by
 CacheBlend (non-prefix hits), and what D still computes:
 
-| Schedule, L1 / worker | Non-prefix, B (256 -> 128 -> 64) | Non-prefix, D | New tokens, D | D's CacheBlend tokens from matches < 256 at chunk 64 |
+| Schedule, L1 per worker, watermark | Non-prefix, B (256 -> 128 -> 64) | Non-prefix, D | New tokens, D | D's CacheBlend tokens from matches < 256 at chunk 64 |
 |---|---|---|---|---|
-| Long sessions, 8 GiB | 7.4 -> 7.8 -> 8.1 | 0.8 -> 1.0 -> 1.1 | 2.7 -> 2.4 -> 2.2 | 13.8% |
-| Long sessions, 32 GiB | 1.8 -> 2.0 -> 2.1 | 0.9 -> 1.0 -> 1.1 | 2.7 -> 2.4 -> 2.2 | 13.8% |
-| Sub-agents, 8 GiB | 12.8 -> 12.9 -> 13.0 | 8.0 -> 8.2 -> 8.4 | 6.5 -> 6.1 -> 5.8 | 1.7% |
-| Tool-result clearing, 8 GiB | 2.2 -> 2.6 -> 2.9 | 1.9 -> 2.2 -> 2.4 | 4.8 -> 4.2 -> 3.8 | 12.9% |
+| Long sessions, 16 GiB, 0.5 | 7.9 -> 8.4 -> 8.7 | 0.6 -> 0.7 -> 0.9 | 3.0 -> 2.7 -> 2.4 | 16.2% |
+| Long sessions, 32 GiB, 0.8 | 2.3 -> 2.4 -> 2.6 | 0.6 -> 0.7 -> 0.8 | 3.0 -> 2.7 -> 2.4 | 16.2% |
+| Sub-agents, 16 GiB, 0.5 | 10.9 -> 10.4 -> 11.4 | 6.4 -> 6.6 -> 6.7 | 8.2 -> 7.7 -> 7.5 | 1.9% |
+| Tool-result clearing, 12 GiB, 0.5 | 2.6 -> 3.1 -> 3.3 | 1.6 -> 1.8 -> 2.1 | 5.2 -> 4.6 -> 4.2 | 14.2% |
 
 Why the gain is small and where it comes from: a stored prompt is cut into
 chunks from its first token, so a reused span of L tokens keeps on average
@@ -89,7 +104,7 @@ file keeps ~90% at 256, ~95% at 128, ~97.5% at 64; a 600-token span keeps
 ~57%, ~79%, ~90%. Most reusable text here sits in long spans (whole files,
 bundles), so halving the chunk adds a few percent to CacheBlend's share; where
 spans are shorter and more numerous (cleared histories) it adds up to a third.
-At 64, matches shorter than 256 tokens appear (in D, 13-14% of CacheBlend's
+At 64, matches shorter than 256 tokens appear (in D, 14-16% of CacheBlend's
 tokens in the long-session and clearing schedules, under 2% with sub-agents):
 boilerplate and partial file views, the short spans the CacheBlend error model
 says reuse least accurately.
@@ -98,7 +113,7 @@ What smaller chunks cost (none of it is in the simulator): 2x / 4x more stored
 objects and lookups per token, 12 / 6 MiB values instead of 24 MiB through
 Valkey and RDMA, and the local matcher's 2^20-chunk table fills 4x sooner
 (67M stored tokens per server at 64). The table was never close in these runs
-(at most ~9K chunks per worker).
+(at most ~8.6K chunks per worker at 256).
 
 GPU smoke test at each size: `scripts/chunk_smoke.sh --legs "B D"` (one worker,
 boots each size, checks that CacheBlend reuses a shifted body). Throughput
@@ -116,12 +131,12 @@ worker turned over all of L1.
 
 Worker moves draw from their own random stream, so a sweep
 (`--move-prob 0,0.5,1`) changes nothing but which agents move. On the
-sub-agent schedule (8 x 5, 5-minute gaps, 8 GiB L1), 20 of 23 gaps had pressure
-of 1 or more: the old worker had already lost the agent's KV, so moving cost
-nothing extra and A to D barely changed with the move probability. Moves only
-matter when L1 is large enough to survive the gap. At 64 GiB per worker, all
-gaps fell below pressure 1, and moving every agent after its gap (q = 1 against
-q = 0) cut A from 85.2% to 81.4% of tokens skipped; its post-gap requests fell
-from 87-97% served to 39-68%. C stayed at 85.4% because those agents found their
-KV in Valkey. That is the regime where the optional move sweep shows Valkey's
-cross-worker value.
+sub-agent schedule (8 x 5, 5-minute gaps) at the default L1 (16 GiB, 0.5), 20
+of 23 gaps had pressure of 1 or more: the old worker had already lost the
+agent's KV, so moving cost nothing extra and A to D barely changed with the
+move probability. Moves only matter when L1 is large enough to survive the gap.
+At 128 GiB per worker (about 64 GiB cached), all gaps fell below pressure 1,
+and moving every agent after its gap (q = 1 against q = 0) cut A from 85.2% to
+81.4% of tokens skipped; its post-gap requests fell from 87-97% served to
+39-68%. C stayed at 85.4% because those agents found their KV in Valkey. That
+is the regime where the optional move sweep shows Valkey's cross-worker value.
