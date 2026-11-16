@@ -17,9 +17,7 @@ moving between inference workers.
 > plugin staging, one-container launch, preflight) comes from Tensormesh's
 > `netapp-cacheblend`; the CacheBlend plugin is pulled with a Tensormesh API key.
 
-Design notes, data choices and open decisions:
-[Momento × Tensormesh agent-swarm benchmark (doc)](https://claude.ai/artifact/7pfdfPvNXfesxdZduGu3rR).
-Short version in [docs/workload.md](docs/workload.md).
+Design notes and data choices in [docs/workload.md](docs/workload.md).
 
 ---
 
@@ -93,8 +91,8 @@ python3 -m swarm.generate ... --gap empirical:data/gaps.json
 
 ## 2. The serving stack
 
-Requirements: Linux, Docker with the NVIDIA Container Toolkit, driver ≥ 580,
-a Tensormesh API key (`tm_…`), and a Valkey endpoint for C and D. For RDMA:
+Requirements: Linux, Docker with the NVIDIA Container Toolkit, driver >= 580,
+a Tensormesh API key (`tm_...`), and a Valkey endpoint for C and D. For RDMA:
 EFA devices and the EFA software on each GPU host, and the valkey-large-object
 module on the Valkey nodes (`scripts/valkey.py blob` checks it). Qwen3-Coder-30B-A3B
 is ~61 GB of weights in bf16: one H200 per worker, or `GPUS_PER_WORKER=2` on 80 GB GPUs.
@@ -162,7 +160,7 @@ amd64 + arm64) and the CacheBlend plugin. Engine (`ENGINE_TAG`) and plugin
 | Needed for | Status in v0.5.8rc1 |
 |---|---|
 | Valkey over TCP (C, D) | Yes (`VALKEY_TRANSPORT=tcp`) |
-| Valkey over RDMA / EFA | Yes (`VALKEY_TRANSPORT=rdma`, the Momento profile's default): needs the valkey-large-object module on the servers, valkey-glide-sync ≥ 2.6.0 in the image (installed at start if missing) and the host's EFA software (libfabric ≥ 2.4), mounted into each worker |
+| Valkey over RDMA / EFA | Yes (`VALKEY_TRANSPORT=rdma`, the Momento profile's default): needs the valkey-large-object module on the servers, valkey-glide-sync >= 2.6.0 in the image (installed at start if missing) and the host's EFA software (libfabric >= 2.4), mounted into each worker |
 | Mixed RDMA and non-RDMA hosts on one cache | Yes (`VALKEY_TRANSPORT=blob-tcp` on hosts without EFA) |
 | Cross-worker CacheBlend (D with a coordinator) | Yes (`scripts/coordinator.sh`, then `COORDINATOR_URL`) |
 | CacheBlend on Qwen3-Coder-30B-A3B (MoE) | The plugin handles routed-expert MoE, but has no card for this model: `verify.sh` runs `scripts/smoke_cb.py`, which fails unless CacheBlend reuses a shifted body |
@@ -180,10 +178,10 @@ What changed from v0.5.6rc4 in how the kit launches workers:
 - The plugin selects the CUSTOM attention backend, block size 64, and turns off
   vLLM's extensible KV cache by itself; the kit passes none of them.
 - With RDMA each worker's LMCache server starts with `--no-l1-use-lazy`, and
-  `VALKEY_WORKERS × L1_SIZE_GB` must fit the EFA card's registered-memory cap
+  `VALKEY_WORKERS x L1_SIZE_GB` must fit the EFA card's registered-memory cap
   (each glide client registers the whole L1). `validate_config` checks it
   against `EFA_MAX_MR_GB`; preflight reads the real cap from `ibv_devinfo`.
-  The Momento profile uses 4 clients × 22 GiB.
+  The Momento profile uses 4 clients x 22 GiB.
 
 ## Tests
 
