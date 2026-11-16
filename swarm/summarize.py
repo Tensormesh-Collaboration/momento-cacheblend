@@ -47,6 +47,31 @@ def read_env(path: Path) -> dict[str, str]:
     return dict(line.split("=", 1) for line in path.read_text().splitlines() if "=" in line)
 
 
+# Failed KV loads and the L1 read race behind them (Tensormesh LM-1157), from
+# the worker logs run_leg.sh copies into the run folder. With
+# KV_LOAD_FAILURE_POLICY=recompute a failed load is recomputed and logged by the
+# connector ("Bypassing LMCache for request ... after a failed async KV load").
+L1_RACE_PATTERNS = ("finish read on non-read-locked key", "finish read on non-existing key",
+                    "Failed to read prefetched object", "Some keys not found during retrieve")
+
+
+def log_counts(run: Path) -> dict[str, int]:
+    out = {"failed_kv_loads": 0, "l1_race_lines": 0, "l1_alloc_failures": 0}
+    for f in run.glob("w*/vllm.log"):
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                if "bypassing lmcache for request" in line.lower():
+                    out["failed_kv_loads"] += 1
+    for f in run.glob("w*/lmcache-server.log"):
+        with open(f, errors="replace") as fh:
+            for line in fh:
+                if any(p in line for p in L1_RACE_PATTERNS):
+                    out["l1_race_lines"] += 1
+                elif "Failed to batched allocate" in line:
+                    out["l1_alloc_failures"] += 1
+    return out
+
+
 def gap_pressure(run: Path, reqs: list[dict], l1_tokens: float, chunk: int) -> list[dict]:
     """One row per request after an idle gap: what its old worker stored during the gap."""
     ts_path = run / "metrics_timeseries.jsonl"
@@ -88,7 +113,8 @@ def gap_pressure(run: Path, reqs: list[dict], l1_tokens: float, chunk: int) -> l
 
 
 def summarize(run: Path, ttft_target: float, recompute_ratio: float, kv_bytes_per_token: int = 98304) -> dict:
-    reqs = [json.loads(line) for line in open(run / "requests.jsonl")]
+    allreqs = [json.loads(line) for line in open(run / "requests.jsonl")]
+    reqs = [r for r in allreqs if not r.get("warmup")]  # the warm-up cohort is not measured
     meta = json.loads((run / "run.json").read_text())
     m = json.loads((run / "metrics.json").read_text())
     ok = [r for r in reqs if r["ok"]]
@@ -135,6 +161,7 @@ def summarize(run: Path, ttft_target: float, recompute_ratio: float, kv_bytes_pe
                                                  / sum(g["prompt_tokens"] for g in served), 1) if served else None)}
     return {
         "run": run.name,
+        "start": meta.get("start", "cold"),
         "leg": env.get("CACHE_MODE", "?") + "+" + env.get("L2_BACKEND", "?"),
         "l1_gb": l1_gb,
         "chunk": chunk,
@@ -157,6 +184,7 @@ def summarize(run: Path, ttft_target: float, recompute_ratio: float, kv_bytes_pe
                                     if total("vllm", "prefix_cache_queries") else None),
         "skipped_tokens_per_task": round(skipped / agents) if agents else None,
         "lmcache_reachable": all(w["lmcache_reachable"] for w in m["workers"]),
+        **log_counts(run),
     }
 
 
@@ -169,9 +197,9 @@ def main() -> None:
     ap.add_argument("-o", "--output", type=Path)
     a = ap.parse_args()
     rows = [summarize(r, a.ttft_target, a.recompute_ratio, a.kv_bytes_per_token) for r in a.runs]
-    cols = ["run", "leg", "l1_gb", "chunk", "move_prob", "requests", "failed", "ttft_p50", "ttft_p99", "ttft_p50_after_idle", "ttft_p50_after_move",
+    cols = ["run", "leg", "start", "l1_gb", "chunk", "move_prob", "requests", "failed", "ttft_p50", "ttft_p99", "ttft_p50_after_idle", "ttft_p50_after_move",
             "goodput_rps", "reused_pct", "non_prefix_pct", "l2_share_of_prefix_hits_pct", "skipped_tokens_per_task",
-            "valkey_evicted_keys"]
+            "valkey_evicted_keys", "failed_kv_loads"]
     fmt = lambda v: "-" if v is None else (f"{v:.3f}" if isinstance(v, float) and v < 10 else str(v))  # noqa: E731
     print("| " + " | ".join(cols) + " |")
     print("|" + "---|" * len(cols))
@@ -190,6 +218,13 @@ def main() -> None:
             print(f"| {r['run']} | " + " | ".join(cells) + " |")
     if any((r["valkey_evicted_keys"] or 0) > 0 for r in rows):
         print("\nWARN: Valkey evicted keys during some legs: its capacity, not L1, limited those runs.")
+    if any(r["failed_kv_loads"] or r["l1_race_lines"] or r["l1_alloc_failures"] for r in rows):
+        print("\nWARN: failed KV loads or L1 errors in the worker logs (recomputed requests, read races, "
+              "L1 allocation failures; Tensormesh LM-1157):")
+        for r in rows:
+            if r["failed_kv_loads"] or r["l1_race_lines"] or r["l1_alloc_failures"]:
+                print(f"  {r['run']}: {r['failed_kv_loads']} failed KV loads (recomputed), "
+                      f"{r['l1_race_lines']} L1 read-race lines, {r['l1_alloc_failures']} L1 allocation failures")
     if any(not r["lmcache_reachable"] for r in rows):
         print("\nWARN: LMCache /metrics unreachable for some workers: token columns are incomplete.")
     if a.output:

@@ -229,14 +229,20 @@ model_complete() {
 # failure minutes into startup. Prints every problem, returns 1 if any.
 validate_config() {
   local errs=() v
-  for v in L1_SIZE_GB L1_ALIGN_BYTES L2_MAX_GB L2_MIN_FREE_GB L2_WORKERS L2_READ_AHEAD L2_PREFETCH_MAX_IN_FLIGHT \
+  for v in L1_SIZE_GB L1_ALIGN_BYTES L2_MAX_GB L2_MIN_FREE_GB L2_WORKERS L2_READ_AHEAD \
            MAX_MODEL_LEN MAX_NUM_SEQS VLLM_PORT LMCACHE_PORT LMCACHE_HTTP_PORT \
            CHUNK_SIZE CB_CHECK_LAYER MODEL_DISK_GB WORKERS GPUS_PER_WORKER WORKER_BASE VALKEY_WORKERS; do
     [[ "${!v:-}" =~ ^[0-9]+$ ]] || errs+=("$v='${!v:-}' must be a whole number")
   done
-  for v in GPU_MEM_UTIL CB_RECOMP_RATIO MQ_TIMEOUT; do
+  for v in GPU_MEM_UTIL CB_RECOMP_RATIO MQ_TIMEOUT L2_PREFETCH_INFLIGHT_WATERMARK; do
     [[ "${!v:-}" =~ ^[0-9]+(\.[0-9]+)?$ ]] || errs+=("$v='${!v:-}' must be a number")
   done
+  case "${KV_LOAD_FAILURE_POLICY:-}" in recompute|fail) ;; *) errs+=("KV_LOAD_FAILURE_POLICY='${KV_LOAD_FAILURE_POLICY:-}' must be recompute or fail") ;; esac
+  # Engine and plugin from the same release line: v0.5.8rc1 and v0.5.8rc2 share v0.5.8.
+  local eline pline
+  eline=$(echo "${ENGINE_TAG:-}" | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+  pline=$(echo "${TM_VERSION:-}" | sed -E 's/^v?([0-9]+\.[0-9]+\.[0-9]+).*/\1/')
+  [ "$eline" = "$pline" ] || errs+=("ENGINE_TAG=${ENGINE_TAG} and TM_VERSION=${TM_VERSION} are different releases: the plugin must match the engine's release line")
   for v in L2_ODIRECT L2_REQUIRE_NETFS FLAG_MATCHED VALKEY_CLUSTER VALKEY_TLS VALKEY_PIP_INSTALL CB_DECODE_CUDAGRAPH ENABLE_APC; do
     [[ "${!v:-}" =~ ^[01]$ ]] || errs+=("$v='${!v:-}' must be 0 or 1")
   done

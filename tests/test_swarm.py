@@ -89,7 +89,8 @@ def _gen(data_dir: Path, out: Path, *extra: str) -> tuple[dict, list[schedule.Ag
 
 
 def test_generate_structure(data_dir, tmp_path):
-    meta, agents = _gen(data_dir, tmp_path / "s")
+    meta, all_agents = _gen(data_dir, tmp_path / "s")
+    _, agents = schedule.split(all_agents)
     assert meta["agents"] == 6 and {a.dev for a in agents} == {0, 1}
     # one shared harness prompt, one preamble per developer
     assert len({a.messages[0]["content"] for a in agents}) == 1
@@ -103,8 +104,8 @@ def test_generate_structure(data_dir, tmp_path):
         assert a.messages[t.msg]["role"] == "assistant" and len(req) == t.msg
     # deterministic for a seed
     _, again = _gen(data_dir, tmp_path / "s2")
-    assert [x.messages for x in again] == [x.messages for x in agents]
-    assert [[t.after_s for t in x.turns] for x in again] == [[t.after_s for t in x.turns] for x in agents]
+    assert [x.messages for x in again] == [x.messages for x in all_agents]
+    assert [[t.after_s for t in x.turns] for x in again] == [[t.after_s for t in x.turns] for x in all_agents]
 
 
 def test_generate_subagents_bundle_and_clearing(data_dir, tmp_path):
@@ -350,3 +351,62 @@ def test_simulator_lmcache_l1_all_or_nothing_and_watermark():
     assert len(l1.d) == 8
     l1.tick(1.0)                                     # one round: evict half of the 8
     assert len(l1.d) == 4 and 0 not in l1 and 7 in l1
+
+
+# --- warm-up cohort ------------------------------------------------------------------
+
+def test_generate_warmup_cohort(data_dir, tmp_path):
+    meta, ags = _gen(data_dir, tmp_path / "w")
+    warm, meas = schedule.split(ags)
+    assert meta["warmup_agents"] == len(warm) == 3 and meta["agents"] == len(meas) == 6
+    assert {a.dev for a in warm} == {2} and all(a.agent.startswith("w0-") for a in warm)
+    assert not {a.instance_id for a in warm} & {a.instance_id for a in meas}
+    assert {t.worker for a in warm for t in a.turns} == {0, 1}          # every worker gets warmed
+    assert not any(t.idle_s or t.moved for a in warm for t in a.turns)
+    assert warm[0].messages[0]["content"] == meas[0].messages[0]["content"]  # same harness prompt
+    # the measured agents are byte-for-byte those of a schedule without a warm-up cohort
+    _, cold = _gen(data_dir, tmp_path / "c", "--warmup-devs", "0")
+    assert (tmp_path / "c" / "sessions.jsonl").read_text() == "".join(
+        line for line in open(tmp_path / "w" / "sessions.jsonl") if '"warmup": true' not in line)
+    assert [a.agent for a in cold] == [a.agent for a in meas]
+
+
+def test_simulator_warm_start_records_only_measured_agents(data_dir, tmp_path):
+    _, ags = _gen(data_dir, tmp_path / "w", "--idle-prob", "0")
+    p = simulate.Prompts(Tokenizer("chars"), ags)
+    n_meas = sum(len(a.turns) for a in ags if not a.warmup)
+    warm = simulate.run(p, "A", 2, 0, 0, False, 1e9, 1e9)
+    cold = simulate.run(p, "A", 2, 0, 0, False, 1e9, 1e9, cold=True)
+    assert warm["totals"]["requests"] == cold["totals"]["requests"] == n_meas
+    # the shared harness prompt is already cached on both workers when the measured agents start
+    assert warm["by_kind"]["first"]["prefix_l1"] > cold["by_kind"]["first"]["prefix_l1"]
+
+
+def test_replay_warm_and_cold(data_dir, tmp_path, mock_engines):
+    _gen(data_dir, tmp_path / "s", "--idle-prob", "0")
+    _, ags = schedule.load(tmp_path / "s")
+    n_warm = sum(len(a.turns) for a in ags if a.warmup)
+    n_meas = sum(len(a.turns) for a in ags if not a.warmup)
+    engines = ",".join(f"http://127.0.0.1:{e}" for e, _ in mock_engines)
+    lmc = ",".join(f"http://127.0.0.1:{m}/metrics" for _, m in mock_engines)
+    for mode in ("warm", "cold"):
+        out = tmp_path / mode
+        subprocess.run([sys.executable, "-m", "swarm.replay", str(tmp_path / "s"), "--engines", engines,
+                        "--lmcache-metrics", lmc, "--time-scale", "0.001", "--idle-scale", "0", "-o", str(out),
+                        *(["--cold"] if mode == "cold" else [])], cwd=ROOT, check=True, timeout=120)
+        reqs = [json.loads(x) for x in open(out / "requests.jsonl")]
+        assert sum(r["warmup"] for r in reqs) == (n_warm if mode == "warm" else 0)
+        assert json.loads((out / "run.json").read_text())["start"] == mode
+        row = summarize.summarize(out, ttft_target=5.0, recompute_ratio=0.15)
+        assert row["requests"] == n_meas and row["start"] == mode and row["failed_kv_loads"] == 0
+
+
+def test_summarize_counts_failed_kv_loads(tmp_path):
+    run = tmp_path / "r"
+    (run / "w0").mkdir(parents=True)
+    (run / "w0" / "vllm.log").write_text(
+        "INFO ok\nWARNING Bypassing LMCache for request a after a failed async KV load; the prompt will be recomputed\n"
+        "WARNING CB: bypassing LMCache for request b after a failed async KV load; the prompt will be recomputed\n")
+    (run / "w0" / "lmcache-server.log").write_text(
+        "WARNING L1Manager: finish read on non-read-locked key\nWARNING Failed to batched allocate 9 memory blocks\n")
+    assert summarize.log_counts(run) == {"failed_kv_loads": 2, "l1_race_lines": 1, "l1_alloc_failures": 1}

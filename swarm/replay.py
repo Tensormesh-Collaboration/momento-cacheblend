@@ -11,6 +11,13 @@ configuration), wait the turn's gap and idle time, send turn k+1. Agents run
 concurrently. Outputs are discarded: the next turn sends the recorded history,
 so every configuration sees identical prompts.
 
+Warm start (the default when the schedule has a warm-up cohort): the warm-up
+agents run first, back to back (gaps scaled by --warmup-time-scale, 0 by
+default), and the run is measured from when they finish: counter deltas,
+start/end time and the agents' start offsets all count from there. Their
+requests are written with "warmup": true, and summarize leaves them out.
+--cold skips the warm-up cohort: the measured agents meet empty caches.
+
 Writes to the output directory:
 
     requests.jsonl   one line per request (TTFT, latency, tokens, worker, ...)
@@ -69,18 +76,22 @@ async def send(client, model: str, messages: list[dict], max_tokens: int, timeou
     return out
 
 
-async def agent_loop(ag: schedule.Agent, clients: list, model: str, a, t_start: float, sink) -> None:
-    await asyncio.sleep(ag.start_s * a.time_scale)
+async def agent_loop(ag: schedule.Agent, clients: list, model: str, a, t_start: float, sink,
+                     time_scale: float | None = None, idle_scale: float | None = None) -> None:
+    """t_start: the run's clock origin (perf_counter); start offsets count from now."""
+    ts = a.time_scale if time_scale is None else time_scale
+    isc = a.idle_scale if idle_scale is None else idle_scale
+    await asyncio.sleep(ag.start_s * ts)
     for k, turn in enumerate(ag.turns):
         w = turn.worker % len(clients)
         t_submit = time.perf_counter() - t_start
         r = await send(clients[w], model, ag.request(k), turn.max_tokens, a.timeout)
-        r.update(agent=ag.agent, dev=ag.dev, turn=k, worker=w, moved=turn.moved,
+        r.update(agent=ag.agent, dev=ag.dev, turn=k, worker=w, moved=turn.moved, warmup=ag.warmup,
                  after_idle=bool(k and ag.turns[k - 1].idle_s), t_submit_s=round(t_submit, 3),
                  t_end_s=round(time.perf_counter() - t_start, 3), max_tokens=turn.max_tokens)
         sink(r)
         if k + 1 < len(ag.turns):
-            await asyncio.sleep(min(a.gap_cap, turn.after_s) * a.time_scale + turn.idle_s * a.idle_scale)
+            await asyncio.sleep(min(a.gap_cap, turn.after_s) * ts + turn.idle_s * isc)
 
 
 async def sample_metrics(lmc: list[str], interval: float, t_start: float, path: Path, stop: asyncio.Event) -> None:
@@ -116,7 +127,10 @@ def scrape_all(engines: list[str], lmc: list[str]) -> list[dict]:
 async def main_async(a) -> None:
     from openai import AsyncOpenAI  # type: ignore
 
-    meta, agents = schedule.load(a.schedule)
+    meta, all_agents = schedule.load(a.schedule)
+    warm_agents, agents = schedule.split(all_agents)
+    if a.cold:
+        warm_agents = []
     if a.limit_agents:
         agents = agents[: a.limit_agents]
     engines = [e.strip() for e in a.engines.split(",") if e.strip()]
@@ -126,14 +140,13 @@ async def main_async(a) -> None:
     model = a.model
     if not model:
         model = (await clients[0].models.list()).data[0].id
-    need = max(t.worker for ag in agents for t in ag.turns) + 1
+    need = max(t.worker for ag in agents + warm_agents for t in ag.turns) + 1
     if need > len(engines):
         print(f"[replay] schedule uses {need} workers, {len(engines)} engines given: workers wrap modulo")
     out = Path(a.output)
     out.mkdir(parents=True, exist_ok=True)
-    before = await asyncio.to_thread(scrape_all, engines, lmc)
     n_done = 0
-    n_total = sum(len(ag.turns) for ag in agents)
+    n_total = sum(len(ag.turns) for ag in agents + warm_agents)
     f = open(out / "requests.jsonl", "w")
 
     def sink(r: dict) -> None:
@@ -147,6 +160,17 @@ async def main_async(a) -> None:
             print(f"[replay] {n_done}/{n_total} requests")
 
     t_start = time.perf_counter()
+    warmup_wall = None
+    if warm_agents:
+        # Warm-up cohort: untimed, back to back; nothing before this point is measured.
+        w0 = time.time()
+        print(f"[replay] warm-up: {len(warm_agents)} agents, {sum(len(x.turns) for x in warm_agents)} requests")
+        await asyncio.gather(*(agent_loop(ag, clients, model, a, t_start, sink,
+                                          time_scale=a.warmup_time_scale, idle_scale=0.0) for ag in warm_agents))
+        warmup_wall = round(time.time() - w0, 1)
+        print(f"[replay] warm-up done in {warmup_wall}s; measuring from here")
+    before = await asyncio.to_thread(scrape_all, engines, lmc)
+    t_start = time.perf_counter()  # the measured run's clock: requests, samples and start offsets
     wall_start = time.time()
     stop = asyncio.Event()
     sampler = asyncio.create_task(sample_metrics(lmc, a.metrics_interval, t_start, out / "metrics_timeseries.jsonl", stop))
@@ -167,6 +191,7 @@ async def main_async(a) -> None:
         "schedule": str(a.schedule), "schedule_meta": meta, "model": model, "engines": engines,
         "args": {k: (str(v) if isinstance(v, Path) else v) for k, v in vars(a).items()},
         "started": wall_start, "ended": time.time(), "requests": n_done,
+        "start": "cold" if not warm_agents else "warm", "warmup_agents": len(warm_agents), "warmup_wall_s": warmup_wall,
     }, indent=2))
     for c in clients:
         await c.close()
@@ -185,6 +210,10 @@ def main() -> None:
     ap.add_argument("--timeout", type=float, default=900.0)
     ap.add_argument("--metrics-interval", type=float, default=5.0,
                     help="seconds between LMCache counter samples (0 = off)")
+    ap.add_argument("--cold", action="store_true",
+                    help="skip the schedule's warm-up cohort: measured agents meet empty caches")
+    ap.add_argument("--warmup-time-scale", type=float, default=0.0,
+                    help="multiply the warm-up agents' gaps and start offsets (0 = back to back)")
     ap.add_argument("--limit-agents", type=int, default=0)
     ap.add_argument("-o", "--output", required=True)
     asyncio.run(main_async(ap.parse_args()))

@@ -37,8 +37,9 @@ One message with several possible causes. Check in this order:
 
 1. **CPU backend.** `grep -i StubCPUDevice logs/w0/lmcache-server.log`. If it matches, the
    driver is too old. The start script normally catches this.
-2. **Version mismatch.** The engine (`ENGINE_TAG`) and plugin (`TM_VERSION`) images must be
-   the same release. Never use `latest` or nightly tags.
+2. **Version mismatch.** The engine (`ENGINE_TAG`) and plugin (`TM_VERSION`) images must come
+   from the same release line (v0.5.8rc1 engine with v0.5.8rc2 plugin is fine). Never use
+   `latest` or nightly tags.
 3. **Split containers.** `mapping of buffer object failed` means CUDA IPC was refused across
    a container boundary. This repo keeps both processes in one container; make sure nothing
    was changed to split them.

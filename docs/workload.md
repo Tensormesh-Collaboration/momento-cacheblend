@@ -51,7 +51,8 @@ moto repo; % of input tokens skipped. "Skipped" counts CacheBlend hits at 85%
 [design.md](design.md)): it evicts once fuller than the watermark, so it caches
 about watermark x its size, and a prompt that does not fit in what is free is
 not stored at all. Every row below keeps the largest prompt of its schedule
-inside the free space (`no-store` = 0).
+inside the free space (`no-store` = 0). Cold start (`--cold`): the warm-up
+cohort the schedules now carry by default moves these rows by under 1 point.
 
 | Schedule | L1 per worker, watermark | A | B | C | D |
 |---|---|---|---|---|---|
@@ -72,14 +73,32 @@ What it says, before the measured runs:
   and D computes about a third of A's new tokens (8.2% against 25.4%).
 - Valkey needs 59-77 GiB for these schedules (the simulator's `L2 peak`).
 
-How far to trust it: on a first GPU run (one H200 worker, a 72-request 2 x 3
-schedule, L1 6 GiB at watermark 0.5, vLLM's GPU prefix cache off), the measured
-legs came within 3.5 points of the simulator:
+How far to trust it: on GPU runs of the README's first-run schedule (one H200
+worker, 72 measured requests, L1 6 GiB at watermark 0.5, vLLM's GPU prefix
+cache off), the measured legs came within 3.5 points of the simulator:
+
+| % of prompt tokens reused | A | B | C | D |
+|---|---|---|---|---|
+| Measured, cold start | 73.8 | 78.5 | 92.1 | 93.1 |
+| Simulator, cold start | 70.3 | 78.6 | 92.1 | 93.0 |
+| Measured, warm start | 75.0 | 79.0 | 92.7 | 94.4 |
+| Simulator, warm start | 72.2 | 77.4 | 92.7 | 94.1 |
+
+And on the headline 8 x 5 sub-agent schedule with all 40 agents on one H200
+worker (L1 16 GiB at watermark 0.5, warm start; the simulator run with
+`--workers 1` to match):
 
 | | A | B | C | D |
 |---|---|---|---|---|
-| Measured, % of prompt tokens reused | 73.8 | 78.5 | 92.1 | 93.1 |
-| Simulator, same schedule and L1 | 70.3 | 78.6 | 92.1 | 93.0 |
+| Measured, % reused (non-prefix) | 63.2 | 77.2 (16.6) | 85.6 | 92.2 (8.2) |
+| Simulator, % reused (non-prefix) | 61.2 | 81.6 (19.5) | 85.5 | 93.7 (8.2) |
+| Measured TTFT p50 / p99, s | 0.39 / 3.56 | 0.32 / 3.28 | 0.41 / 2.25 | 0.42 / 3.84 |
+
+No request failed and no KV load failed. D logged 6 L1 allocation failures:
+with 40 agents on one worker, CacheBlend sometimes loads more chunks in one
+batch (up to 12 GiB) than L1 keeps free (8 GiB), and such a batch is skipped
+and recomputed. B's CacheBlend share falls short of the simulator's, as on the
+small schedule: its index points at chunks already evicted from L1.
 
 The simulator has no queueing and no timing effects on hit rates; use it to
 pick L1 sizes and legs, and the GPU runs for results.

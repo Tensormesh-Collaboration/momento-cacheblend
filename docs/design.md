@@ -49,8 +49,8 @@ Details: [workload.md](workload.md).
 - One worker = one GPU running vLLM and the LMCache server in one container
   (they share GPU memory over CUDA IPC). Workers on a host share nothing but
   the host.
-- Versions: LMCache engine image and cacheblend-plugin, both v0.5.8rc1 (they
-  must always match).
+- Versions: LMCache engine image v0.5.8rc1 and cacheblend-plugin v0.5.8rc2
+  (rc1 plus one fix; engine and plugin must come from the same release line).
 
 ### vLLM's GPU prefix cache is off
 
@@ -84,12 +84,27 @@ defaults (full CUDA graphs, chunked prefill): use it only for a goodput
 comparison, and label it. vLLM warns that this model does not officially
 support disabling chunked prefill; no failures were seen in testing.
 
-### Cold caches
+### Warm start
 
 Every leg starts from empty caches: fresh workers (empty L1) and this kit's
 Valkey keys deleted (only keys under `VALKEY_KEY_PREFIX@`, never the whole
-database). There is no warm-up cohort yet, so the first requests of every
-agent are misses in all four legs.
+database). It then warms them before measuring, by default: one extra
+developer's agents (the warm-up cohort, `swarm.generate --warmup-devs 1`) are
+replayed first, back to back and untimed, across all workers. They work on the
+same repository with tasks no measured agent uses, so they leave behind what a
+fleet that has been running would: the shared harness prompt and the repo's
+commonly read files, in L1 and in Valkey. The leg is measured from when they
+finish: counter deltas, wall time and the measured agents' start offsets all
+count from there, and their requests are left out of every result.
+
+Without it, every leg opens with the misses no cache can avoid (each agent's
+first turn, each file the first time anyone reads it). Those shrink every
+leg's numbers and favour whichever configuration fills fastest, while a real
+fleet runs continuously. The measured agents are byte-for-byte the same with
+or without the cohort, so warm and cold runs compare directly:
+`WARM_START=0` (or `scripts/sweep.sh --start cold`) measures from empty caches.
+In the simulator the warm-up moves results by under 1 point on the main
+schedules and by up to 2 points on the small first-run schedule.
 
 ### Replies
 
@@ -155,8 +170,14 @@ reported.
   large-object module's own stats.
 - **Latency**: TTFT per request, overall and for requests after an idle gap or
   a move; goodput is requests under a TTFT target per second.
-- **Per run**: the configuration (`config.env`), Valkey's evictions, and an
-  idle-gap table from LMCache counters the replay samples every 5 s.
+- **Failed KV loads**: with `KV_LOAD_FAILURE_POLICY=recompute` (every leg), a
+  KV load that fails is recomputed instead of failing the request; the summary
+  counts them from the worker logs (`failed_kv_loads`) and warns about LMCache
+  L1 read-race and allocation errors (Tensormesh LM-1157). They cost hits, so a
+  leg with many of them understates that configuration.
+- **Per run**: the configuration (`config.env`), warm or cold start, Valkey's
+  evictions, and an idle-gap table from LMCache counters the replay samples
+  every 5 s.
 
 ## Decisions
 
@@ -169,7 +190,7 @@ reported.
 | 5 | Unit and quality | A task is one agent session; accuracy is out of scope for this harness |
 | 6 | Tier split inside Valkey | From the large-object module's stats, per run |
 | 7 | Capacity axis | L1 per worker, below the working set; Valkey above it, evictions checked |
-| 8 | Warm or cold start | Cold start for now (a warm-up cohort is not implemented) |
+| 8 | Warm or cold start | Warm: one untimed warm-up developer first (default); cold as a switch |
 | 9 | Idle gaps | The swarm keeps running during gaps; results grouped by eviction pressure |
 | 10 | Routing | Sticky, move after an idle gap with probability 0.5; optional sweep 0 / 0.5 / 1 |
 | 11 | Chunk alignment | Natural offsets (files lose their partial edge chunks) |

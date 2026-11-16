@@ -81,9 +81,11 @@ def build(a: argparse.Namespace) -> None:
         repo = next(iter(corpus.repo_counts(paths)))
     sessions = corpus.load_sessions(paths, repo)
     need = a.devs * a.agents
-    if len(sessions) < need:
-        raise SystemExit(f"{repo}: {len(sessions)} distinct instances in these shards, need {need}. "
-                         f"Use more shards or a smaller swarm (corpus.repo_counts lists repos).")
+    wneed = a.warmup_devs * a.agents
+    if len(sessions) < need + wneed:
+        raise SystemExit(f"{repo}: {len(sessions)} distinct instances in these shards, need {need + wneed} "
+                         f"({need} measured + {wneed} warm-up). Use more shards, a smaller swarm or "
+                         f"fewer --warmup-devs (corpus.repo_counts lists repos).")
     rng = random.Random(a.seed)
     rng.shuffle(sessions)
 
@@ -160,9 +162,62 @@ def build(a: argparse.Namespace) -> None:
             agents.append(schedule.Agent(agent=f"d{d}-a{j}", dev=d, instance_id=s.instance_id,
                                          start_s=start, messages=msgs, turns=turns))
 
-    # --- stats ------------------------------------------------------------
+    # --- warm-up cohort ---------------------------------------------------
+    # Developers replayed before measuring, untimed (design decision 8): they
+    # leave the shared harness prompt and the repo's popular files in L1 and
+    # Valkey, as a fleet that has been running would. Drawn from instances the
+    # measured developers do not use, with their own random stream, so the
+    # measured agents are the same with or without them.
+    wrng = random.Random(a.seed * 104729 + 3)
+    used = {s.instance_id for s in pool}
+    rest = [s for s in sessions if s.instance_id not in used]
+    if a.grouping == "area":
+        wpool = sorted(rest[: wneed * 3], key=lambda s: (area_of(s), s.instance_id))[:wneed]
+    else:
+        wpool = rest[:wneed]
+    for w in range(a.warmup_devs):
+        d = a.devs + w
+        group = wpool[w * a.agents:(w + 1) * a.agents]
+        preamble = filler(a.dev_preamble_tokens, tok, a.seed * 1000 + d + 1, f"## Developer {d} notes")
+        bundle = ""
+        if a.subagent_turns and a.bundle_files:
+            pop = Counter()
+            text = {}
+            for s in group:
+                for idx, path in s.file_views:
+                    pop[path] += 1
+                    text.setdefault(path, s.messages[idx]["content"])
+            files = [text[p] for p, _ in pop.most_common(a.bundle_files)]
+            if files:
+                bundle = "\n\nContext from the lead agent:\n\n" + "\n\n".join(files)
+        for j, s in enumerate(group):
+            msgs = [dict(m) for m in s.messages]
+            msgs[0]["content"] = harness
+            first_user = next(i for i, m in enumerate(msgs) if m["role"] == "user")
+            msgs[first_user]["content"] = (preamble + "\n\n" if preamble else "") + msgs[first_user]["content"] + bundle
+            turns_idx = [i for i, m in enumerate(msgs) if m["role"] == "assistant"][: a.subagent_turns or a.max_turns]
+            msgs = msgs[: turns_idx[-1] + 1]
+            mtoks = [len(tok.message(m["role"], m["content"])) for m in msgs]
+            obs = [i for i, m in enumerate(msgs) if m["role"] == "user" and i > first_user]
+            cleared = set()
+            worker = j % a.workers  # every worker gets warmed
+            turns = []
+            for ti in turns_idx:
+                if a.clear_trigger and sum(placeholder_tokens if i in cleared else mtoks[i] for i in range(ti)) > a.clear_trigger:
+                    past = [i for i in obs if i < ti]
+                    cleared |= set(past[:-a.clear_keep] if a.clear_keep else past)
+                out_tokens = max(a.min_output_tokens, min(a.max_output_tokens, mtoks[ti] - 4))
+                turns.append(schedule.Turn(msg=ti, max_tokens=out_tokens, worker=worker,
+                                           after_s=round(gap(wrng), 3), idle_s=0.0, cleared=sorted(cleared)))
+            agents.append(schedule.Agent(agent=f"w{w}-a{j}", dev=d, instance_id=s.instance_id,
+                                         start_s=round(wrng.uniform(0, a.agent_stagger), 3), messages=msgs,
+                                         turns=turns, warmup=True))
+
+    # --- stats (measured agents) ---------------------------------------------
     lens = []
     for ag in agents:
+        if ag.warmup:
+            continue
         mt = [len(tok.message(m["role"], m["content"])) for m in ag.messages]
         for t in ag.turns:
             c = set(t.cleared)
@@ -176,7 +231,9 @@ def build(a: argparse.Namespace) -> None:
         "tokenizer": tok.name,
         "tokenizer_exact": tok.exact,
         "args": {k: v for k, v in vars(a).items() if k not in ("func",)},
-        "agents": len(agents),
+        "agents": sum(1 for ag in agents if not ag.warmup),
+        "warmup_agents": sum(1 for ag in agents if ag.warmup),
+        "warmup_requests": sum(len(ag.turns) for ag in agents if ag.warmup),
         "requests": len(lens),
         "prompt_tokens": {"p50": lens[len(lens) // 2], "p90": lens[int(0.9 * (len(lens) - 1))],
                           "max": lens[-1], "mean": round(statistics.mean(lens))},
@@ -185,7 +242,8 @@ def build(a: argparse.Namespace) -> None:
         "moves": sum(1 for ag in agents for t in ag.turns if t.moved),
     }
     schedule.save(Path(a.output), meta, agents)
-    print(f"[generate] {repo}: {len(agents)} agents, {len(lens)} requests, prompt p50 "
+    print(f"[generate] {repo}: {meta['agents']} agents, {len(lens)} requests (+ warm-up: {meta['warmup_agents']} agents, "
+          f"{meta['warmup_requests']} requests), prompt p50 "
           f"{meta['prompt_tokens']['p50']} / p90 {meta['prompt_tokens']['p90']} tokens "
           f"({tok.name}), {meta['idle_gaps']} idle gaps, {meta['moves']} moves -> {a.output}")
 
@@ -200,6 +258,9 @@ def parser() -> argparse.ArgumentParser:
     g = ap.add_argument_group("swarm")
     g.add_argument("--devs", type=int, default=4)
     g.add_argument("--agents", type=int, default=5, help="agents per developer")
+    g.add_argument("--warmup-devs", type=int, default=1,
+                   help="developers (of --agents each) replayed before measuring, untimed, to start from warm caches; "
+                        "0 = no warm-up cohort (replay --cold skips it anyway)")
     g.add_argument("--grouping", choices=("area", "random"), default="area")
     g.add_argument("--max-turns", type=int, default=40, help="cap on turns per agent (long mode)")
     g.add_argument("--subagent-turns", type=int, default=0, help="sub-agent mode: keep the first K turns")

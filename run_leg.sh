@@ -67,7 +67,7 @@ for w in $(worker_ids); do
   METRICS+="${METRICS:+,}http://127.0.0.1:$(worker_http_port "$w")/metrics"
 done
 # Every setting, exported or not (load_env sets most without exporting them).
-for v in $(compgen -v | grep -E '^(CACHE_MODE|L2_|VALKEY_|L1_|CHUNK_SIZE|WORKERS|GPUS_PER_WORKER|HOST_GPUS|GPU_MEM_UTIL|TM_VERSION|ENGINE_TAG|HF_REPO|MAX_MODEL_LEN|MAX_NUM_SEQS|FLAG_MATCHED|ENABLE_APC|CB_|COORDINATOR_URL|TIME_SCALE|IDLE_SCALE|EVICTION_|MAX_REQUEST_TOKENS)' \
+for v in $(compgen -v | grep -E '^(CACHE_MODE|L2_|VALKEY_|L1_|CHUNK_SIZE|WORKERS|GPUS_PER_WORKER|HOST_GPUS|GPU_MEM_UTIL|TM_VERSION|ENGINE_TAG|HF_REPO|MAX_MODEL_LEN|MAX_NUM_SEQS|FLAG_MATCHED|ENABLE_APC|CB_|COORDINATOR_URL|TIME_SCALE|IDLE_SCALE|EVICTION_|MAX_REQUEST_TOKENS|WARM_START|KV_LOAD_FAILURE_POLICY)' \
          | grep -v PASSWORD | sort); do
   printf '%s=%s\n' "$v" "${!v}"
 done > "${OUT}/config.env"
@@ -79,7 +79,8 @@ if [ "${L2_BACKEND}" = valkey ]; then
 fi
 rc=0
 ( cd "${KIT_DIR}" && "${PY}" -m swarm.replay "${SCHED}" --engines "${ENGINES}" --lmcache-metrics "${METRICS}" \
-    --time-scale "${TIME_SCALE}" --idle-scale "${IDLE_SCALE}" -o "${OUT}" ) || rc=$?
+    --time-scale "${TIME_SCALE}" --idle-scale "${IDLE_SCALE}" $([ "${WARM_START:-1}" = 1 ] || echo --cold) \
+    -o "${OUT}" ) || rc=$?
 
 if [ "${L2_BACKEND}" = valkey ]; then
   "${PY}" "${KIT_DIR}/scripts/valkey.py" stats > "${OUT}/valkey_after.json" || rm -f "${OUT}/valkey_after.json"

@@ -39,6 +39,7 @@ what has not:
 | Path | Status |
 |---|---|
 | One worker per host, legs A-D, Valkey over TCP (single Valkey 8.1, no auth) | Tested end to end: 4 legs x 72 requests, 0 failures |
+| Plugin v0.5.8rc2 on engine v0.5.8rc1, `KV_LOAD_FAILURE_POLICY=recompute`, `L2_PREFETCH_INFLIGHT_WATERMARK=0.2` | Tested (2026-11-16): B and D boot and blend; the runs below had 0 failed KV loads and 0 L1 read-race errors |
 | CacheBlend on Qwen3-Coder-30B-A3B, at chunk 256 / 128 / 64, from L1 (B) and with Valkey (D) | Tested (`verify.sh`, `chunk_smoke.sh`: CacheBlend reuses a shifted body) |
 | vLLM's GPU prefix cache off; L1 eviction watermark and the free-space check | Tested |
 | Simulator against measured legs | Within 3.5 points on the test schedule ([workload.md](docs/workload.md#offline-preview-qwen3-coder-tokenizer-unbounded-valkey-2-workers)) |
@@ -47,9 +48,10 @@ what has not:
 | Two or more workers per host (`WORKERS=2`, the profile's default), worker moves on GPUs | **Not tested** on GPUs (simulator only) |
 | Cross-worker CacheBlend (`scripts/coordinator.sh`) | **Not tested** |
 | Valkey cluster mode, TLS, password (`VALKEY_CLUSTER`, `VALKEY_TLS`, `VALKEY_PASSWORD`) | **Not tested** |
-| Headline schedules (4 x 5 long sessions, 8 x 5 sub-agents) on GPUs | **Not run yet** (simulated) |
+| 8 x 5 sub-agent schedule (the headline) on one worker: all 40 agents on one GPU, L1 16 GiB at 0.5, warm | Tested: A 63.2 / B 77.2 / C 85.6 / D 92.2% reused, 0 failed requests; D logged 6 L1 allocation failures ([workload.md](docs/workload.md)) |
+| The headline on two workers (the profile's setting); 4 x 5 long sessions on GPUs | **Not run yet** (simulated) |
 | arm64 hosts | **Not tested** (the engine image is multi-arch) |
-| Warm-up cohort before measuring (design decision 8) | Not implemented: every leg starts from empty caches |
+| Warm-up cohort before measuring (design decision 8, the default) | Tested: first run and the 8 x 5 sub-agent schedule, warm start |
 | Accuracy | Out of scope for this harness: use `lmcache bench quality` |
 
 ---
@@ -97,7 +99,8 @@ docker run -d --name momento-valkey -p 172.17.0.1:6390:6379 valkey/valkey:8.1 \
 ./setup.sh                 # Python env (.venv), key (asks once), model, preflight, plugin
 source .venv/bin/activate
 
-# 2 developers x 3 agents, 12 turns each, 60 s idle gaps: 72 requests, prompts up to ~25K tokens
+# 2 developers x 3 agents, 12 turns each, 60 s idle gaps: 72 measured requests, prompts up to
+# ~25K tokens, plus a warm-up developer (3 agents, 36 requests) replayed first, untimed
 python -m swarm.generate --download-shards 1,4 --data data/swesmith --repo getmoto__moto \
     --devs 2 --agents 3 --max-turns 12 --idle-prob 0.3 --idle-s 60 --workers 1 -o schedules/smoke-2x3
 
@@ -107,20 +110,24 @@ EVICTION_WATERMARK=0.5 MAX_REQUEST_TOKENS=26000 \
     scripts/sweep.sh --schedules schedules/smoke-2x3 --legs "A B C D" --l1 6 --name first-run
 ```
 
-Each leg takes about 8 minutes (2 to boot, 6 for the schedule) and starts from
-empty caches. `scripts/sweep.sh` prints one summary table at the end (also in
+Each leg takes about 8.5 minutes (2 to boot, about 20 s of warm-up, 6 for the
+schedule) and starts from empty caches, warmed by the warm-up developer before
+measuring. `scripts/sweep.sh` prints one summary table at the end (also in
 `runs/<timestamp>-sweep-first-run/summary.md`). Reference, measured on one H200
-NVL (dev host, 2026-11-13):
+NVL (dev host, 2026-11-16, plugin v0.5.8rc2):
 
-| Leg | reused_pct | non_prefix_pct | l2_share_of_prefix_hits_pct | valkey_evicted_keys |
-|---|---|---|---|---|
-| A | 73.8 | 0 | 0 | - |
-| B | 78.5 | 4.7 | - | - |
-| C | 92.1 | 0 | 19.8 | 0 |
-| D | 93.1 | 1.0 | - | 0 |
+| Leg | start | reused_pct | non_prefix_pct | l2_share_of_prefix_hits_pct | valkey_evicted_keys | failed_kv_loads |
+|---|---|---|---|---|---|---|
+| A | warm | 75.0 | 0 | 0 | - | 0 |
+| B | warm | 79.0 | 4.6 | - | - | 0 |
+| C | warm | 92.7 | 0 | 19.5 | 0 | 0 |
+| D | warm | 94.4 | 1.7 | - | 0 | 0 |
+
+From empty caches (`--start cold`, plugin v0.5.8rc1, 2026-11-13 and -15) the
+same legs measured 73.8-74.4 / 78.5 / 92.1 / 93.1.
 
 Expect the same within a few points (A to D in that order, C and D well above
-A and B), 72 requests and 0 failures per leg. Every leg's `verify.sh` must
+A and B), 72 measured requests and 0 failures per leg. Every leg's `verify.sh` must
 pass, including "CacheBlend reuses a shifted body" in B and D. If C or D shows
 0% reused, check its `w0/lmcache-server.log` for `Failed to batched allocate`
 ([troubleshooting](docs/troubleshooting.md)).
@@ -205,6 +212,56 @@ or recomputes it.
 Valkey keys live under `VALKEY_KEY_PREFIX@`. `scripts/valkey.py wipe` deletes
 only those, never the whole database.
 
+### Valkey over RDMA (EFA)
+
+The profile uses Valkey over TCP because that is the path tested so far
+([Status](#status)). Switching to Valkey Large Object over RDMA is a settings
+change plus three host prerequisites.
+
+**Prerequisites**
+
+| Where | What | Checked by |
+|---|---|---|
+| GPU hosts | An EFA-enabled instance type: `/dev/infiniband/uverbs*` present (the kit passes them into each worker) | `preflight.sh` |
+| GPU hosts | The AWS EFA software installed at `/opt/amazon/efa` (libfabric >= 2.4). The kit mounts it read-only into each worker (`EFA_HOST_DIR`) | `preflight.sh` (`fi_info -p efa`), the worker's entrypoint (`libfabric.so.1` loads) |
+| GPU hosts | Security groups and placement that let EFA traffic reach the Valkey nodes | - |
+| Valkey nodes | The valkey-large-object module loaded on every node | `preflight.sh` (`scripts/valkey.py blob`, BLOB.INFO) |
+| Engine image | valkey-glide-sync >= 2.6.0: installed into each worker at start (needs network from the container; otherwise bake it into an image) | the worker's entrypoint |
+
+**Settings**, in `cacheblend.env.local`:
+
+```bash
+VALKEY_TRANSPORT=rdma
+VALKEY_NODES=10.0.1.20:6379,10.0.1.21:6379          # module-enabled nodes
+VALKEY_RDMA_INTERFACE=rdmap71s0-rdm,rdmap72s0-rdm   # /opt/amazon/efa/bin/fi_info -p efa | grep domain
+EFA_MAX_MR_GB=384                                   # this card's max_mr_size: ibv_devinfo -v | grep max_mr_size
+# as the deployment needs:  VALKEY_CLUSTER=1   VALKEY_TLS=1   VALKEY_PASSWORD=...
+```
+
+**Check it**, before any measured leg:
+
+```bash
+./setup.sh                                  # preflight: EFA devices, fabric domains, registration cap, BLOB.INFO
+scripts/chunk_smoke.sh --legs "D" --chunks "256"   # one worker: boots D and checks Valkey receives objects
+```
+
+**Limits to know**
+
+- Each RDMA client registers the whole L1 with the card, so `VALKEY_WORKERS x
+  L1_SIZE_GB` must fit `EFA_MAX_MR_GB` (`validate_config` refuses otherwise). The
+  profile's 4 clients x 16 GiB need 64 GiB.
+- With several fabric domains in `VALKEY_RDMA_INTERFACE`, clients are spread over
+  them round-robin: keep `VALKEY_WORKERS` a multiple of their number.
+- RDMA pins all of L1 when the worker starts (`--no-l1-use-lazy`), so startup takes
+  longer with a large L1.
+- TCP keys and large-object keys cannot share a key prefix. `run_leg.sh` wipes the
+  prefix before every leg; after switching transports by hand, run
+  `scripts/valkey.py wipe` first.
+- Hosts without EFA can share the same cache with `VALKEY_TRANSPORT=blob-tcp`
+  (large-object values over the normal connection; not faster than `tcp`).
+- If a worker exits at startup, `docker logs momento-w<i>` names the missing piece
+  (libfabric not loadable, no EFA devices in the container, glide too old).
+
 ## 3. Run the four legs
 
 The headline run is the sub-agent schedule at the profile's defaults (two
@@ -215,7 +272,12 @@ for leg in A B C D; do ./run_leg.sh $leg --schedule schedules/moto-8x5-sub; done
 python -m swarm.summarize runs/*-A runs/*-B runs/*-C runs/*-D --ttft-target 2.0
 ```
 
-Each leg starts from empty caches, runs the whole schedule, and leaves
+Each leg starts from empty caches and, by default, warms them first: the
+schedule's warm-up developer (`swarm.generate --warmup-devs`, 1 by default) is
+replayed back to back and untimed, and the leg is measured from when it
+finishes, as a fleet that has been running would be (`WARM_START=0`, or
+`scripts/sweep.sh --start cold`, measures from empty caches; `--start "warm cold"`
+runs both). It then runs the whole schedule and leaves
 `runs/<timestamp>-<leg>/` with `requests.jsonl` (per request: TTFT, latency,
 tokens, worker, whether it followed an idle gap or a move), `metrics.json`
 (LMCache and vLLM counter deltas per worker), `config.env` and each worker's logs.
@@ -228,8 +290,10 @@ scripts/sweep.sh --schedules "schedules/sub-q0 schedules/sub-q0.5 schedules/sub-
     --legs "A C" --l1 "16 128" --name moves
 ```
 
-The summary adds, per run: the sweep coordinates (L1, chunk, move
-probability), Valkey's own evictions during the leg (`valkey_evicted_keys`,
+The summary adds, per run: warm or cold start, the sweep coordinates (L1,
+chunk, move probability), failed KV loads that were recomputed
+(`failed_kv_loads`, from the worker logs, with a warning that also counts
+LMCache's L1 read-race and allocation errors), Valkey's own evictions during the leg (`valkey_evicted_keys`,
 from `scripts/valkey.py stats` before and after; anything above 0 means Valkey's
 capacity limited the run), and an idle-gap table: requests after a gap grouped by
 the eviction pressure on the agent's old worker, from the LMCache counters the
@@ -247,9 +311,22 @@ for the idle-gap sweep.
 
 ## Versions
 
-The kit pins **v0.5.8rc1** for both the engine image (`lmcache/vllm-openai:v0.5.8rc1`,
-amd64 + arm64) and the CacheBlend plugin. Engine (`ENGINE_TAG`) and plugin
-(`TM_VERSION`) must always be the same release.
+The kit pins the engine image **v0.5.8rc1** (`lmcache/vllm-openai:v0.5.8rc1`,
+amd64 + arm64) and the CacheBlend plugin **v0.5.8rc2**. Engine (`ENGINE_TAG`) and
+plugin (`TM_VERSION`) must come from the same release line (`validate_config`
+checks): the plugin imports LMCache internals that move between releases. Plugin
+rc2 is rc1 plus one fix, which only calls v0.5.8rc1 APIs: a CacheBlend request
+whose KV load fails is recomputed instead of hanging. There is no v0.5.8rc2
+engine image yet.
+
+Known issue in LMCache v0.5.8rc1 (Tensormesh LM-1157): with many requests
+prefetching from L2 into a small L1, L1 can fill with data waiting to be used
+and stall, and eviction can race with reads and fail KV loads. Seen at 150+
+concurrent requests; our test runs (up to 16 per worker) showed neither. The
+kit mitigates both: `L2_PREFETCH_INFLIGHT_WATERMARK=0.2` (LMCache's default is
+0.5) and `KV_LOAD_FAILURE_POLICY=recompute` in every leg, so a failed load
+costs a recompute instead of an HTTP 500. The summary reports how many there
+were.
 
 | Needed for | Status in v0.5.8rc1 |
 |---|---|

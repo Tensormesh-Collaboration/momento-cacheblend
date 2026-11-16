@@ -63,7 +63,8 @@ registry_login || die "${REGISTRY} rejected TM_API_KEY (reason above). Keys expi
        sed -i '/^TM_API_KEY=/d' ${LOCAL_ENV} && ./setup.sh     (it will ask again)"
 echo "  ${REGISTRY} ok"
 # Checking the exact tag now, not after a 20-minute setup, is the whole point:
-# engine and plugin tags must match (a documented cause of the 300 s hang).
+# engine and plugin must come from the same release line (a documented cause of
+# the 300 s hang; validate_config checks it).
 docker manifest inspect "${PLUGIN_IMAGE}" >/dev/null 2>&1 \
   || die "${PLUGIN_IMAGE} is not pullable with this key — the tag may not exist, or the key's image grants exclude it."
 echo "  ${PLUGIN_IMAGE} available"

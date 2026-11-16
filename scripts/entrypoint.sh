@@ -132,7 +132,7 @@ if [ -n "${L2_ADAPTER:-}" ]; then
     --l2-adapter "${L2_ADAPTER}"
     --l2-store-policy "${L2_STORE_POLICY:-default}"
     --l2-prefetch-policy "${L2_PREFETCH_POLICY:-default}"
-    --l2-prefetch-max-in-flight "${L2_PREFETCH_MAX_IN_FLIGHT:-8}"
+    --l2-prefetch-inflight-watermark "${L2_PREFETCH_INFLIGHT_WATERMARK:-0.2}"
   )
 fi
 
@@ -236,6 +236,7 @@ if e.get("CACHE_MODE", "blend") == "blend":
 else:
     connector = "LMCacheMPConnector"
 print(json.dumps({"kv_connector": connector, "kv_role": "kv_both",
+                  "kv_load_failure_policy": e.get("KV_LOAD_FAILURE_POLICY", "recompute"),
                   "kv_connector_extra_config": extra}))')
 if [ "${CB_DECODE_CUDAGRAPH:-1}" = 1 ]; then
   GRAPH_ARGS=( --compilation-config '{"mode":0,"cudagraph_mode":"FULL_DECODE_ONLY"}' )
