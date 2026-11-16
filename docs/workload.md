@@ -1,8 +1,5 @@
 # The swarm workload
 
-Full reasoning, data comparison and open decisions are in the design doc
-(linked from the README). This page is the short version for people running it.
-
 ## What it reproduces
 
 Many coding agents work on one repository. Each agent's own turns are prefix
@@ -53,11 +50,11 @@ CacheBlend hits at 85% (15% recompute).
 
 | Schedule | L1 / worker | A | B | C | D |
 |---|---|---|---|---|---|
-| 4 × 5, long sessions (678 requests) | 8 GiB | 79.4 | 86.0 | 96.4 | 97.1 |
-| 4 × 5, long sessions | 32 GiB | 93.7 | 95.2 | 96.4 | 97.1 |
-| 8 × 5, sub-agents, 6 turns, 4-file bundle (240 requests) | 8 GiB | 74.5 | 83.9 | 85.4 | 92.3 |
-| 8 × 5, sub-agents | 32 GiB | 81.4 | 88.9 | 85.4 | 92.3 |
-| 4 × 5, tool-result clearing over 24K, keep 3 | 8 GiB | 88.7 | 90.5 | 93.2 | 94.9 |
+| 4 x 5, long sessions (678 requests) | 8 GiB | 79.4 | 86.0 | 96.4 | 97.1 |
+| 4 x 5, long sessions | 32 GiB | 93.7 | 95.2 | 96.4 | 97.1 |
+| 8 x 5, sub-agents, 6 turns, 4-file bundle (240 requests) | 8 GiB | 74.5 | 83.9 | 85.4 | 92.3 |
+| 8 x 5, sub-agents | 32 GiB | 81.4 | 88.9 | 85.4 | 92.3 |
+| 4 x 5, tool-result clearing over 24K, keep 3 | 8 GiB | 88.7 | 90.5 | 93.2 | 94.9 |
 
 What it says, before any GPU time:
 
@@ -78,12 +75,12 @@ LRU; treat it as a way to pick the legs worth running, not as results.
 schedules and assumptions as above; the share of input tokens served by
 CacheBlend (non-prefix hits), and what D still computes:
 
-| Schedule, L1 / worker | Non-prefix, B (256 → 128 → 64) | Non-prefix, D | New tokens, D | D's CacheBlend tokens from matches < 256 at chunk 64 |
+| Schedule, L1 / worker | Non-prefix, B (256 -> 128 -> 64) | Non-prefix, D | New tokens, D | D's CacheBlend tokens from matches < 256 at chunk 64 |
 |---|---|---|---|---|
-| Long sessions, 8 GiB | 7.4 → 7.8 → 8.1 | 0.8 → 1.0 → 1.1 | 2.7 → 2.4 → 2.2 | 13.8% |
-| Long sessions, 32 GiB | 1.8 → 2.0 → 2.1 | 0.9 → 1.0 → 1.1 | 2.7 → 2.4 → 2.2 | 13.8% |
-| Sub-agents, 8 GiB | 12.8 → 12.9 → 13.0 | 8.0 → 8.2 → 8.4 | 6.5 → 6.1 → 5.8 | 1.7% |
-| Tool-result clearing, 8 GiB | 2.2 → 2.6 → 2.9 | 1.9 → 2.2 → 2.4 | 4.8 → 4.2 → 3.8 | 12.9% |
+| Long sessions, 8 GiB | 7.4 -> 7.8 -> 8.1 | 0.8 -> 1.0 -> 1.1 | 2.7 -> 2.4 -> 2.2 | 13.8% |
+| Long sessions, 32 GiB | 1.8 -> 2.0 -> 2.1 | 0.9 -> 1.0 -> 1.1 | 2.7 -> 2.4 -> 2.2 | 13.8% |
+| Sub-agents, 8 GiB | 12.8 -> 12.9 -> 13.0 | 8.0 -> 8.2 -> 8.4 | 6.5 -> 6.1 -> 5.8 | 1.7% |
+| Tool-result clearing, 8 GiB | 2.2 -> 2.6 -> 2.9 | 1.9 -> 2.2 -> 2.4 | 4.8 -> 4.2 -> 3.8 | 12.9% |
 
 Why the gain is small and where it comes from: a stored prompt is cut into
 chunks from its first token, so a reused span of L tokens keeps on average
@@ -119,7 +116,7 @@ worker turned over all of L1.
 
 Worker moves draw from their own random stream, so a sweep
 (`--move-prob 0,0.5,1`) changes nothing but which agents move. On the
-sub-agent schedule (8 × 5, 5-minute gaps, 8 GiB L1), 20 of 23 gaps had pressure
+sub-agent schedule (8 x 5, 5-minute gaps, 8 GiB L1), 20 of 23 gaps had pressure
 of 1 or more: the old worker had already lost the agent's KV, so moving cost
 nothing extra and A to D barely changed with the move probability. Moves only
 matter when L1 is large enough to survive the gap. At 64 GiB per worker, all
