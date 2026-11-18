@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import secrets
 import sys
 import time
 import urllib.request
@@ -56,7 +57,10 @@ def main() -> int:
         return t[: a.chunk]
 
     words = "apple banana cherry orange grape tiger lion elephant zebra panda".split()
-    body = ids(" ".join(f"{words[i % len(words)]}{i:04d}" for i in range(220)))
+    # Unique per run: with a shared L2, another worker's smoke test has already stored a fixed body,
+    # and this worker's second request would be a prefix hit from L2 instead of a blend.
+    run = secrets.token_hex(3)
+    body = ids(" ".join(f"{words[i % len(words)]}{run}{i:04d}" for i in range(220)))
     suffix = ids("\nQ: name one word from the list above.\nA:")
     prompts = {
         "warmup": preamble("Alpha bravo charlie delta echo") + body + suffix,

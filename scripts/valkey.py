@@ -136,10 +136,10 @@ def main() -> int:
                 print(f"{host}:{port} {c.cmd('PING')}")
             elif action == "blob":
                 # The rdma and blob-tcp transports need the valkey-large-object
-                # module; LMCache's adapter checks it the same way (BLOB.INFO).
-                info = c.cmd("BLOB.INFO")
-                flat = info if isinstance(info, str) else " ".join(str(x) for x in (info or []))
-                print(f"{host}:{port} BLOB.INFO ok: {flat[:300]}")
+                # module; LMCache's adapter checks it the same way: BLOB.INFO on a
+                # key that need not exist.
+                c.cmd("BLOB.INFO", f"{prefix}@__blob_probe__")
+                print(f"{host}:{port} BLOB.INFO ok")
             elif action == "info":
                 info = dict(l.split(":", 1) for l in c.cmd("INFO", "memory").splitlines() if ":" in l)
                 try:
