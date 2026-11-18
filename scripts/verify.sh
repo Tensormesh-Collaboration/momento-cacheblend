@@ -56,11 +56,13 @@ if [ "${L2_BACKEND}" != none ]; then
   echo "== D. L2 (${L2_BACKEND}) =="
   before=$(count_l2)
   VLLM_PORT=$PORT "${PY}" - <<'PY'
-import json, os, urllib.request
+import json, os, secrets, urllib.request
 port = os.environ["VLLM_PORT"]
+# Unique per run: a fixed prompt is already in a shared L2 after the first worker's check, so
+# every later worker would store nothing new.
 body = json.dumps({
     "model": os.environ.get("SERVED_NAME", ""),
-    "messages": [{"role": "user", "content": "Summarize this. " + ("The quick brown fox jumps over the lazy dog. " * 1500)}],
+    "messages": [{"role": "user", "content": f"Summarize this ({secrets.token_hex(4)}). " + ("The quick brown fox jumps over the lazy dog. " * 1500)}],
     "max_tokens": 8,
 }).encode()
 req = urllib.request.Request(f"http://localhost:{port}/v1/chat/completions", data=body,

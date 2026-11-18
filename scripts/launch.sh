@@ -75,7 +75,8 @@ RDMA_ARGS=()
 if [ "${L2_BACKEND}" = valkey ] && [ "${VALKEY_TRANSPORT}" = rdma ]; then
   if [ "${VALKEY_RDMA_PROVIDER}" != tcp ]; then
     for dev in /dev/infiniband/*; do
-      [ -e "$dev" ] && RDMA_ARGS+=( --device "$dev" )
+      # Device nodes only: by-ibdev/ and by-path/ are directories of symlinks, which docker rejects.
+      [ -c "$dev" ] && RDMA_ARGS+=( --device "$dev" )
     done
     [ ${#RDMA_ARGS[@]} -gt 0 ] || { echo "FATAL: VALKEY_TRANSPORT=rdma but no /dev/infiniband devices on this host (EFA driver loaded?)" >&2; exit 1; }
   fi
@@ -119,6 +120,7 @@ docker run -d --name "${NAME}" \
   -e CB_RECOMP_RATIO="${CB_RECOMP_RATIO}" \
   -e L1_SIZE_GB="${L1_SIZE_GB}" \
   -e L1_INIT_SIZE_GB="${L1_INIT_SIZE_GB:-}" \
+  -e RDMA_L1_LAZY="${RDMA_L1_LAZY:-0}" \
   -e L1_ALIGN_BYTES="${L1_ALIGN_BYTES}" \
   -e EVICTION_WATERMARK="${EVICTION_WATERMARK:-0.8}" \
   -e EVICTION_RATIO="${EVICTION_RATIO:-0.2}" \

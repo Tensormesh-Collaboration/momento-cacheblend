@@ -150,8 +150,10 @@ fi
 # L1_INIT_SIZE_GB (when set) pins only that much up front and grows lazily.
 # RDMA registers the whole L1 arena with the fabric at start-up, so the arena
 # must exist in full: --no-l1-use-lazy (LMCache docs, Valkey RDMA notes).
+# RDMA_L1_LAZY=1 keeps the lazy allocator, pinned in full at startup: CacheBlend's
+# retrieve refuses L1 objects from any other allocator (v0.5.8rc1).
 L1_ARGS=( --l1-init-size-gb "${L1_INIT_SIZE_GB:-${L1_SIZE_GB}}" )
-if [ "${L2_BACKEND:-none}" = valkey ] && [ "${VALKEY_TRANSPORT:-tcp}" = rdma ]; then
+if [ "${L2_BACKEND:-none}" = valkey ] && [ "${VALKEY_TRANSPORT:-tcp}" = rdma ] && [ "${RDMA_L1_LAZY:-0}" != 1 ]; then
   L1_ARGS=( --no-l1-use-lazy )
 fi
 case "${CACHE_MODE:-blend}" in
